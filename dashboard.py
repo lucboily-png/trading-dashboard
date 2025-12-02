@@ -230,4 +230,3 @@ except Exception as e:
 
 now = datetime.now(pytz.timezone("America/New_York"))
 st.caption(f"🕒 Last update: {now.strftime('%Y-%m-%d %H:%M:%S')} NY")
-
