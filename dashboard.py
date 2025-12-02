@@ -39,16 +39,6 @@ ACCESS_TOKEN = "c934bb8699bd3ec60e58b918a3d5399b-27034ab74bc7b6a1f2546817767e57d
 ACCOUNT_ID = "101-002-37205058-001"
 client = API(access_token=ACCESS_TOKEN, environment="practice")
 
-st.subheader("P/L non réalisé (positions ouvertes)")
-
-unrealized_total, detail = get_unrealized_pl(OANDA_ACCOUNT_ID, ACCOUNT_ID,)
-
-if unrealized_total is None:
-    st.error("Impossible de récupérer les positions ouvertes.")
-else:
-    color = "green" if unrealized_total >= 0 else "red"
-    st.markdown(f"<h2 style='color:{color};'> {unrealized_total:.2f} </h2>", unsafe_allow_html=True)
-
 
 # --- Sidebar Config ---
 st.sidebar.title("Configuration des instruments")
@@ -230,3 +220,4 @@ except Exception as e:
 
 now = datetime.now(pytz.timezone("America/New_York"))
 st.caption(f"🕒 Last update: {now.strftime('%Y-%m-%d %H:%M:%S')} NY")
+
