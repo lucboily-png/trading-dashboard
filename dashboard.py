@@ -41,7 +41,7 @@ client = API(access_token=ACCESS_TOKEN, environment="practice")
 
 st.subheader("P/L non réalisé (positions ouvertes)")
 
-unrealized_total, detail = get_unrealized_pl(ACCOUNT_ID, OANDA_ACCOUNT_ID)
+unrealized_total, detail = get_unrealized_pl(OANDA_ACCOUNT_ID, ACCOUNT_ID,)
 
 if unrealized_total is None:
     st.error("Impossible de récupérer les positions ouvertes.")
