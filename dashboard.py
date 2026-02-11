@@ -27,7 +27,6 @@ def play_voice_alert(url):
     """
     components.html(audio_script, height=0, width=0)
 
-
 # --- Voice files ---
 VOICE_STRONG_BULL = "https://cdn.pixabay.com/download/audio/2023/03/22/audio_7e47f7d88e.mp3?filename=alert-female-strong-bullish.mp3"
 VOICE_WEAK_BULL  = "https://cdn.pixabay.com/download/audio/2023/03/22/audio_45ad3f98f1.mp3?filename=alert-female-weak-bullish.mp3"
@@ -39,11 +38,10 @@ ACCESS_TOKEN = "c934bb8699bd3ec60e58b918a3d5399b-27034ab74bc7b6a1f2546817767e57d
 ACCOUNT_ID = "101-002-37205058-001"
 client = API(access_token=ACCESS_TOKEN, environment="practice")
 
-
 # --- Sidebar Config ---
 st.sidebar.title("Configuration des instruments")
 instruments_config = []
-pairs = ["EUR_USD", "AUD_USD", "GBP_USD", "BTC_USD"]
+pairs = ["EUR_USD", "AUD_USD", "GBP_USD", "BTC_USD", "GBP_JPY"]
 
 for i in range(4):
     pair = st.sidebar.selectbox(f"Pair {i+1}:", pairs, index=i)
@@ -96,7 +94,6 @@ def get_current_price(pair):
         return float(r.response["candles"][-1]["mid"]["c"])
     except:
         return None
-
 
 # --- DISPLAY EACH INSTRUMENT ---
 for config in instruments_config:
@@ -220,4 +217,3 @@ except Exception as e:
 
 now = datetime.now(pytz.timezone("America/New_York"))
 st.caption(f"🕒 Last update: {now.strftime('%Y-%m-%d %H:%M:%S')} NY")
-
