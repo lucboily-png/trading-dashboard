@@ -41,7 +41,7 @@ client = API(access_token=ACCESS_TOKEN, environment="practice")
 # --- Sidebar Config ---
 st.sidebar.title("Configuration des instruments")
 instruments_config = []
-pairs = ["EUR_USD", "AUD_USD", "GBP_USD", "BTC_USD", "GBP_JPY"]
+pairs = ["EUR_USD", "AUD_USD", "GBP_USD", "BTC_USD", "ETH_USD", "XAU_USD"]
 
 for i in range(4):
     pair = st.sidebar.selectbox(f"Pair {i+1}:", pairs, index=i)
