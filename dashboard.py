@@ -45,7 +45,7 @@ pairs = ["EUR_USD", "AUD_USD", "GBP_USD", "BTC_USD", "GBP_JPY"]
 
 for i in range(4):
     pair = st.sidebar.selectbox(f"Pair {i+1}:", pairs, index=i)
-    timeframe = st.sidebar.selectbox(f"Timeframe {i+1}:", ["M1", "M5", "M15", "H1", "H4", "D1", "D4"], index=1)
+    timeframe = st.sidebar.selectbox(f"Timeframe {i+1}:", ["M1", "M5", "M15","M30", "H1", "H4", "D", "W"], index=1)
     instruments_config.append({"pair": pair, "timeframe": timeframe})
 
 mute_alerts = st.sidebar.checkbox("Mute alerts", value=False)
