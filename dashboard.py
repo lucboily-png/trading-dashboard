@@ -12,6 +12,8 @@ from streamlit_autorefresh import st_autorefresh
 
 from oandapyV20.endpoints.accounts import AccountInstruments
 
+r = AccountInstruments(accountID=ACCOUNT_ID)
+client.request(r)
 
 for inst in r.response["instruments"]:
     print(inst["name"])
@@ -47,7 +49,7 @@ client = API(access_token=ACCESS_TOKEN, environment="practice")
 # --- Sidebar Config ---
 st.sidebar.title("Configuration des instruments")
 instruments_config = []
-pairs = ["EUR_USD", "US500_USD", "AUD_USD", "GBP_USD", "BTC_USD", "ETH_USD", "XAU_USD", "USD_CAD"]
+pairs = ["EUR_USD", "SPX500_USD", "AUD_USD", "GBP_USD", "BTC_USD", "ETH_USD", "XAU_USD", "USD_CAD"]
 
 for i in range(4):
     pair = st.sidebar.selectbox(f"Pair {i+1}:", pairs, index=i)
