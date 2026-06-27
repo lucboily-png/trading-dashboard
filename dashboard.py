@@ -10,13 +10,6 @@ import oandapyV20.endpoints.instruments as instruments
 from oandapyV20.endpoints.transactions import TransactionList
 from streamlit_autorefresh import st_autorefresh
 
-from oandapyV20.endpoints.accounts import AccountInstruments
-
-r = AccountInstruments(accountID=ACCOUNT_ID)
-client.request(r)
-
-for inst in r.response["instruments"]:
-    print(inst["name"])
     
 # --- Page config ---
 st.set_page_config(page_title="Trading Monitor + Voice Alerts", layout="wide")
