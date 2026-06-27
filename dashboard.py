@@ -12,8 +12,6 @@ from streamlit_autorefresh import st_autorefresh
 
 from oandapyV20.endpoints.accounts import AccountInstruments
 
-r = AccountInstruments(accountID=ACCOUNT_ID)
-client.request(r)
 
 for inst in r.response["instruments"]:
     print(inst["name"])
