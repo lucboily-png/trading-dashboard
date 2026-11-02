@@ -4,3 +4,4 @@ plotly
 pytz
 oandapyV20
 streamlit_autorefresh
+six
