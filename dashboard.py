@@ -566,6 +566,133 @@ def get_active_fvgs(df):
     return active_gaps
 
 
+def calculate_trade_levels(df_m30, active_gaps, direction, current_price):
+    """
+    Calcule des niveaux indicatifs à partir du FVG actif le plus récent,
+    des derniers pivots M30 et d'un coussin basé sur l'ATR.
+    Aucun niveau n'est envoyé à OANDA.
+    """
+
+    result = {
+        "direction": direction,
+        "entry": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "risk_distance": None,
+        "reward_distance": None,
+        "rr": None,
+        "target_method": "N/D",
+        "fvg_zone": "Aucune",
+        "status": "Niveaux indisponibles"
+    }
+
+    if direction not in ("LONG", "SHORT") or not active_gaps or len(df_m30) < 10:
+        return result
+
+    wanted_type = "Bullish FVG" if direction == "LONG" else "Bearish FVG"
+    matching_gaps = [g for g in active_gaps if g.get("type") == wanted_type]
+
+    if not matching_gaps:
+        result["status"] = "Aucun FVG actif dans le sens du scénario"
+        return result
+
+    # FVG le plus récent dans le sens de la confluence
+    gap = matching_gaps[-1]
+    gap_bottom = float(gap["bottom"])
+    gap_top = float(gap["top"])
+    entry = (gap_bottom + gap_top) / 2.0
+
+    # Pivots M30 confirmés (rolling window centré de 5 bougies)
+    recent = df_m30.tail(120).copy()
+    highs = recent["high"].astype(float)
+    lows = recent["low"].astype(float)
+
+    swing_high_mask = highs.eq(highs.rolling(5, center=True).max())
+    swing_low_mask = lows.eq(lows.rolling(5, center=True).min())
+
+    swing_highs = highs[swing_high_mask].dropna().tolist()
+    swing_lows = lows[swing_low_mask].dropna().tolist()
+
+    # ATR simplifié sur 14 bougies pour éviter un stop collé au niveau.
+    prev_close = df_m30["close"].shift(1)
+    true_range = pd.concat(
+        [
+            df_m30["high"] - df_m30["low"],
+            (df_m30["high"] - prev_close).abs(),
+            (df_m30["low"] - prev_close).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+    atr = float(true_range.tail(14).mean())
+    buffer = max(atr * 0.10, abs(entry) * 0.0001)
+
+    if direction == "LONG":
+        structural_lows = [v for v in swing_lows if v < entry]
+        swing_level = max(structural_lows) if structural_lows else None
+        stop_reference = min(gap_bottom, swing_level) if swing_level is not None else gap_bottom
+        stop_loss = stop_reference - buffer
+
+        structural_targets = [v for v in swing_highs if v > entry]
+        valid_targets = sorted(
+            v for v in structural_targets
+            if (v - entry) >= (entry - stop_loss) * 1.5
+        )
+        if valid_targets:
+            take_profit = valid_targets[0]
+            target_method = "Prochain swing high M30"
+        else:
+            take_profit = entry + (entry - stop_loss) * 2.0
+            target_method = "Projection 2R (aucun swing high assez éloigné)"
+
+        risk_distance = entry - stop_loss
+        reward_distance = take_profit - entry
+
+    else:
+        structural_highs = [v for v in swing_highs if v > entry]
+        swing_level = min(structural_highs) if structural_highs else None
+        stop_reference = max(gap_top, swing_level) if swing_level is not None else gap_top
+        stop_loss = stop_reference + buffer
+
+        structural_targets = [v for v in swing_lows if v < entry]
+        valid_targets = sorted(
+            (v for v in structural_targets
+             if (entry - v) >= (stop_loss - entry) * 1.5),
+            reverse=True
+        )
+        if valid_targets:
+            take_profit = valid_targets[0]
+            target_method = "Prochain swing low M30"
+        else:
+            take_profit = entry - (stop_loss - entry) * 2.0
+            target_method = "Projection 2R (aucun swing low assez éloigné)"
+
+        risk_distance = stop_loss - entry
+        reward_distance = entry - take_profit
+
+    if risk_distance <= 0 or reward_distance <= 0:
+        result["status"] = "Calcul impossible : niveaux incohérents"
+        return result
+
+    rr_value = reward_distance / risk_distance
+
+    result.update({
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_distance": risk_distance,
+        "reward_distance": reward_distance,
+        "rr": rr_value,
+        "target_method": target_method,
+        "fvg_zone": f"{gap_bottom:.5f} à {gap_top:.5f}",
+        "status": "Plan indicatif — à valider"
+    })
+
+    if rr_value < 1.5:
+        result["status"] = "Ratio inférieur à 1,5 — configuration à éviter"
+
+    return result
+
+
 def get_confluence_analysis(pair):
 
     result = {
@@ -582,6 +709,17 @@ def get_confluence_analysis(pair):
         "FVG": "Aucun",
         "FVG_actifs": 0,
         "Zones_FVG_actives": "Aucune",
+        "Setup_M30": "En attente",
+        "Prix_dans_FVG": "Non",
+        "Rejet_M30": "Aucun",
+        "Plan_direction": "N/D",
+        "Plan_entree": None,
+        "Plan_stop": None,
+        "Plan_tp": None,
+        "Plan_rr": None,
+        "Plan_target_method": "N/D",
+        "Plan_fvg_zone": "Aucune",
+        "Plan_status": "Niveaux indisponibles",
         "score": 0,
         "bullish_score": 0,
         "bearish_score": 0,
@@ -690,6 +828,46 @@ def get_confluence_analysis(pair):
                 )
             result["Zones_FVG_actives"] = " | ".join(zone_descriptions)
 
+        # Validation du retour dans un FVG et du rejet sur la dernière M30 complète.
+        last_m30 = df_m30.iloc[-1]
+        price_in_bullish_fvg = False
+        price_in_bearish_fvg = False
+        bullish_rejection = False
+        bearish_rejection = False
+
+        for gap in active_gaps:
+            price_inside = gap["bottom"] <= current_price <= gap["top"]
+            candle_touched_zone = (
+                float(last_m30["low"]) <= gap["top"]
+                and float(last_m30["high"]) >= gap["bottom"]
+            )
+
+            if gap["type"] == "Bullish FVG":
+                price_in_bullish_fvg = price_in_bullish_fvg or price_inside
+                if (
+                    candle_touched_zone
+                    and float(last_m30["close"]) > float(last_m30["open"])
+                    and float(last_m30["close"]) > gap["top"]
+                ):
+                    bullish_rejection = True
+
+            elif gap["type"] == "Bearish FVG":
+                price_in_bearish_fvg = price_in_bearish_fvg or price_inside
+                if (
+                    candle_touched_zone
+                    and float(last_m30["close"]) < float(last_m30["open"])
+                    and float(last_m30["close"]) < gap["bottom"]
+                ):
+                    bearish_rejection = True
+
+        if price_in_bullish_fvg or price_in_bearish_fvg:
+            result["Prix_dans_FVG"] = "Oui"
+
+        if bullish_rejection:
+            result["Rejet_M30"] = "Haussier"
+        elif bearish_rejection:
+            result["Rejet_M30"] = "Baissier"
+
         # Confluence
         bullish_score = 0
         bearish_score = 0
@@ -730,6 +908,48 @@ def get_confluence_analysis(pair):
             result["decision"] = "ATTENTE"
             result["details"] = "Confluence insuffisante ou contradictoire"
 
+        # La tendance seule ne constitue pas un signal d'entrée.
+        if result["decision"] == "ACHAT POTENTIEL":
+            if bullish_rejection:
+                result["Setup_M30"] = "ACHAT À VALIDER"
+            elif price_in_bullish_fvg:
+                result["Setup_M30"] = "ZONE HAUSSIÈRE ATTEINTE — attendre rejet"
+            else:
+                result["Setup_M30"] = "ATTENDRE RETOUR DANS FVG HAUSSIER"
+
+        elif result["decision"] == "VENTE POTENTIELLE":
+            if bearish_rejection:
+                result["Setup_M30"] = "VENTE À VALIDER"
+            elif price_in_bearish_fvg:
+                result["Setup_M30"] = "ZONE BAISSIÈRE ATTEINTE — attendre rejet"
+            else:
+                result["Setup_M30"] = "ATTENDRE RETOUR DANS FVG BAISSIER"
+
+        else:
+            result["Setup_M30"] = "PAS DE SETUP — confluence insuffisante"
+
+        trade_direction = None
+        if result["decision"] == "ACHAT POTENTIEL":
+            trade_direction = "LONG"
+        elif result["decision"] == "VENTE POTENTIELLE":
+            trade_direction = "SHORT"
+
+        trade_plan = calculate_trade_levels(
+            df_m30,
+            active_gaps,
+            trade_direction,
+            current_price
+        )
+
+        result["Plan_direction"] = trade_plan["direction"] or "N/D"
+        result["Plan_entree"] = trade_plan["entry"]
+        result["Plan_stop"] = trade_plan["stop_loss"]
+        result["Plan_tp"] = trade_plan["take_profit"]
+        result["Plan_rr"] = trade_plan["rr"]
+        result["Plan_target_method"] = trade_plan["target_method"]
+        result["Plan_fvg_zone"] = trade_plan["fvg_zone"]
+        result["Plan_status"] = trade_plan["status"]
+
     except Exception as e:
         result["details"] = str(e)
 
@@ -738,13 +958,13 @@ def get_confluence_analysis(pair):
 
 def build_decision_assistant(analysis):
     """
-    Produit une lecture structurée et prudente.
-    Ce module n'envoie aucun ordre et ne remplace pas une validation manuelle.
+    Distingue le biais de marché d'une configuration d'entrée.
+    Aucun ordre n'est envoyé automatiquement.
     """
 
     decision = analysis.get("decision", "ATTENTE")
+    setup = analysis.get("Setup_M30", "En attente")
     price_vs_200 = analysis.get("Prix_vs_EMA200", "N/D")
-    price_vs_50 = analysis.get("Prix_vs_EMA50", "N/D")
     h4 = analysis.get("H4", "N/D")
     h1 = analysis.get("H1", "N/D")
     m30 = analysis.get("M30", "N/D")
@@ -752,54 +972,77 @@ def build_decision_assistant(analysis):
     bull = analysis.get("bullish_score", 0)
     bear = analysis.get("bearish_score", 0)
     zones = analysis.get("Zones_FVG_actives", "Aucune")
+    rejection = analysis.get("Rejet_M30", "Aucun")
 
     if decision == "ACHAT POTENTIEL":
         if price_vs_200 != "Au-dessus":
-            verdict = "ATTENDRE — signal haussier, mais prix sous EMA 200 H4"
+            verdict = "BIAIS HAUSSIER — ATTENDRE"
             confirmation = (
-                "Attendre que le prix repasse au-dessus de l'EMA 200 H4 "
-                "et qu'une clôture M30 confirme la reprise."
+                "Le prix n'est pas au-dessus de l'EMA 200 H4. "
+                "Attendre une reprise confirmée au-dessus de cette moyenne."
+            )
+        elif setup == "ACHAT À VALIDER":
+            verdict = "CONFIGURATION D'ACHAT — VALIDATION MANUELLE"
+            confirmation = (
+                "Un FVG haussier actif a été retesté et la dernière bougie M30 "
+                "montre un rejet haussier. Vérifier le contexte, le stop-loss "
+                "et le ratio risque/rendement avant toute décision."
+            )
+        elif setup.startswith("ZONE HAUSSIÈRE"):
+            verdict = "ZONE D'ACHAT ATTEINTE — ATTENDRE"
+            confirmation = (
+                "Le prix se trouve dans un FVG haussier actif. "
+                "Attendre une bougie M30 haussière qui rejette la zone."
             )
         else:
-            verdict = "BIAIS HAUSSIER — achat à confirmer"
+            verdict = "BIAIS HAUSSIER — PAS ENCORE D'ENTRÉE"
             confirmation = (
-                "Attendre un repli contrôlé vers une zone FVG haussière active "
-                "ou un retest confirmé, puis une réaction haussière en M30."
+                "Attendre un retour du prix dans un FVG haussier actif, "
+                "puis une confirmation de rejet haussier en M30."
             )
-
         invalidation = (
             "Réévaluer le scénario si la structure M30 devient baissière "
-            "ou si le prix clôture durablement sous l'EMA 200 H4."
+            "ou si le prix clôture sous l'EMA 200 H4."
         )
 
     elif decision == "VENTE POTENTIELLE":
         if price_vs_200 != "En dessous":
-            verdict = "ATTENDRE — signal baissier, mais prix au-dessus EMA 200 H4"
+            verdict = "BIAIS BAISSIER — ATTENDRE"
             confirmation = (
-                "Attendre que le prix repasse sous l'EMA 200 H4 "
-                "et qu'une clôture M30 confirme la faiblesse."
+                "Le prix n'est pas sous l'EMA 200 H4. "
+                "Attendre une faiblesse confirmée sous cette moyenne."
+            )
+        elif setup == "VENTE À VALIDER":
+            verdict = "CONFIGURATION DE VENTE — VALIDATION MANUELLE"
+            confirmation = (
+                "Un FVG baissier actif a été retesté et la dernière bougie M30 "
+                "montre un rejet baissier. Vérifier le contexte, le stop-loss "
+                "et le ratio risque/rendement avant toute décision."
+            )
+        elif setup.startswith("ZONE BAISSIÈRE"):
+            verdict = "ZONE DE VENTE ATTEINTE — ATTENDRE"
+            confirmation = (
+                "Le prix se trouve dans un FVG baissier actif. "
+                "Attendre une bougie M30 baissière qui rejette la zone."
             )
         else:
-            verdict = "BIAIS BAISSIER — vente à confirmer"
+            verdict = "BIAIS BAISSIER — PAS ENCORE D'ENTRÉE"
             confirmation = (
-                "Attendre un retour vers une zone FVG baissière active "
-                "ou un retest confirmé, puis une réaction baissière en M30."
+                "Attendre un retour du prix dans un FVG baissier actif, "
+                "puis une confirmation de rejet baissier en M30."
             )
-
         invalidation = (
             "Réévaluer le scénario si la structure M30 devient haussière "
-            "ou si le prix clôture durablement au-dessus de l'EMA 200 H4."
+            "ou si le prix clôture au-dessus de l'EMA 200 H4."
         )
 
     else:
-        verdict = "ATTENTE — pas assez de confluence"
+        verdict = "ATTENTE — CONFLUENCE INSUFFISANTE"
         confirmation = (
-            "Attendre un alignement plus clair entre H4, H1, M30 et les FVG actifs. "
-            "Éviter de prendre une position au milieu de signaux contradictoires."
+            "Attendre un alignement plus clair entre H4, H1 et M30. "
+            "Ne pas transformer un mouvement isolé en signal d'entrée."
         )
-        invalidation = (
-            "Aucun scénario directionnel prioritaire pour le moment."
-        )
+        invalidation = "Aucun scénario directionnel prioritaire pour le moment."
 
     return {
         "verdict": verdict,
@@ -807,16 +1050,21 @@ def build_decision_assistant(analysis):
         "invalidation": invalidation,
         "lecture": (
             f"Confluence : {bull}/4 haussières contre {bear}/4 baissières. "
-            f"H4 : {h4} | H1 : {h1} | M30 : {m30}. "
-            f"Prix vs EMA 50 : {price_vs_50}. FVG : {fvg}."
+            f"H4 : {h4} | H1 : {h1} | M30 : {m30}. FVG : {fvg}."
         ),
-        "zones": zones
+        "setup": setup,
+        "rejection": rejection,
+        "zones": zones,
+        "entry": analysis.get("Plan_entree"),
+        "stop": analysis.get("Plan_stop"),
+        "target": analysis.get("Plan_tp"),
+        "rr": analysis.get("Plan_rr"),
+        "target_method": analysis.get("Plan_target_method", "N/D"),
+        "plan_status": analysis.get("Plan_status", "Niveaux indisponibles"),
+        "plan_direction": analysis.get("Plan_direction", "N/D"),
+        "plan_fvg_zone": analysis.get("Plan_fvg_zone", "Aucune")
     }
 
-
-# =========================================================
-# CRÉATION DU GRAPHIQUE
-# =========================================================
 
 def create_chart(
     df,
@@ -999,8 +1247,16 @@ if instruments_config:
             "M30": analysis["M30"],
             "FVG M30": analysis["FVG"],
             "FVG actifs M30": analysis["FVG_actifs"],
+            "Prix dans FVG": analysis["Prix_dans_FVG"],
             "Zones FVG actives": analysis["Zones_FVG_actives"],
             "Assistant": build_decision_assistant(analysis)["verdict"],
+            "Validation M30": analysis["Setup_M30"],
+            "Rejet M30": analysis["Rejet_M30"],
+            "Entrée théorique": analysis["Plan_entree"],
+            "Stop Loss": analysis["Plan_stop"],
+            "Take Profit": analysis["Plan_tp"],
+            "Ratio R/R": analysis["Plan_rr"],
+            "Plan": analysis["Plan_status"],
             "Score haussier": analysis["bullish_score"],
             "Score baissier": analysis["bearish_score"],
             "Décision": analysis["decision"],
@@ -1163,6 +1419,27 @@ for config in instruments_config:
             st.subheader("Assistant de décision")
             st.markdown(f"**{assistant['verdict']}**")
             st.write(assistant["lecture"])
+            st.markdown(f"**État du setup :** {assistant['setup']}")
+            st.markdown(f"**Rejet M30 détecté :** {assistant['rejection']}")
+
+            st.markdown("#### Plan de trade indicatif — niveaux M30")
+            if assistant["entry"] is not None:
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric("Entrée théorique", f"{assistant['entry']:.5f}")
+                p2.metric("Stop Loss", f"{assistant['stop']:.5f}")
+                p3.metric("Take Profit", f"{assistant['target']:.5f}")
+                p4.metric(
+                    "Ratio R/R",
+                    f"1:{assistant['rr']:.2f}" if assistant["rr"] is not None else "N/D"
+                )
+                st.caption(
+                    f"Zone FVG utilisée : {assistant['plan_fvg_zone']} | "
+                    f"Cible : {assistant['target_method']} | "
+                    f"{assistant['plan_status']}"
+                )
+            else:
+                st.info(assistant["plan_status"])
+
             st.markdown(f"**Confirmation à attendre :** {assistant['confirmation']}")
             st.markdown(f"**Invalidation / prudence :** {assistant['invalidation']}")
             st.caption(f"Zones FVG M30 actives : {assistant['zones']}")
