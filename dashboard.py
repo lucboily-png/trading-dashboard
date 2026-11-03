@@ -580,6 +580,8 @@ def get_confluence_analysis(pair):
         "H1": "N/D",
         "M30": "N/D",
         "FVG": "Aucun",
+        "FVG_actifs": 0,
+        "Zones_FVG_actives": "Aucune",
         "score": 0,
         "bullish_score": 0,
         "bearish_score": 0,
@@ -678,6 +680,15 @@ def get_confluence_analysis(pair):
             fvg_direction = "Aucun"
 
         result["FVG"] = fvg_direction
+        result["FVG_actifs"] = len(active_gaps)
+
+        if active_gaps:
+            zone_descriptions = []
+            for gap in active_gaps[-5:]:
+                zone_descriptions.append(
+                    f'{gap["type"]}: {gap["bottom"]:.5f} à {gap["top"]:.5f}'
+                )
+            result["Zones_FVG_actives"] = " | ".join(zone_descriptions)
 
         # Confluence
         bullish_score = 0
@@ -723,6 +734,84 @@ def get_confluence_analysis(pair):
         result["details"] = str(e)
 
     return result
+
+
+def build_decision_assistant(analysis):
+    """
+    Produit une lecture structurée et prudente.
+    Ce module n'envoie aucun ordre et ne remplace pas une validation manuelle.
+    """
+
+    decision = analysis.get("decision", "ATTENTE")
+    price_vs_200 = analysis.get("Prix_vs_EMA200", "N/D")
+    price_vs_50 = analysis.get("Prix_vs_EMA50", "N/D")
+    h4 = analysis.get("H4", "N/D")
+    h1 = analysis.get("H1", "N/D")
+    m30 = analysis.get("M30", "N/D")
+    fvg = analysis.get("FVG", "Aucun")
+    bull = analysis.get("bullish_score", 0)
+    bear = analysis.get("bearish_score", 0)
+    zones = analysis.get("Zones_FVG_actives", "Aucune")
+
+    if decision == "ACHAT POTENTIEL":
+        if price_vs_200 != "Au-dessus":
+            verdict = "ATTENDRE — signal haussier, mais prix sous EMA 200 H4"
+            confirmation = (
+                "Attendre que le prix repasse au-dessus de l'EMA 200 H4 "
+                "et qu'une clôture M30 confirme la reprise."
+            )
+        else:
+            verdict = "BIAIS HAUSSIER — achat à confirmer"
+            confirmation = (
+                "Attendre un repli contrôlé vers une zone FVG haussière active "
+                "ou un retest confirmé, puis une réaction haussière en M30."
+            )
+
+        invalidation = (
+            "Réévaluer le scénario si la structure M30 devient baissière "
+            "ou si le prix clôture durablement sous l'EMA 200 H4."
+        )
+
+    elif decision == "VENTE POTENTIELLE":
+        if price_vs_200 != "En dessous":
+            verdict = "ATTENDRE — signal baissier, mais prix au-dessus EMA 200 H4"
+            confirmation = (
+                "Attendre que le prix repasse sous l'EMA 200 H4 "
+                "et qu'une clôture M30 confirme la faiblesse."
+            )
+        else:
+            verdict = "BIAIS BAISSIER — vente à confirmer"
+            confirmation = (
+                "Attendre un retour vers une zone FVG baissière active "
+                "ou un retest confirmé, puis une réaction baissière en M30."
+            )
+
+        invalidation = (
+            "Réévaluer le scénario si la structure M30 devient haussière "
+            "ou si le prix clôture durablement au-dessus de l'EMA 200 H4."
+        )
+
+    else:
+        verdict = "ATTENTE — pas assez de confluence"
+        confirmation = (
+            "Attendre un alignement plus clair entre H4, H1, M30 et les FVG actifs. "
+            "Éviter de prendre une position au milieu de signaux contradictoires."
+        )
+        invalidation = (
+            "Aucun scénario directionnel prioritaire pour le moment."
+        )
+
+    return {
+        "verdict": verdict,
+        "confirmation": confirmation,
+        "invalidation": invalidation,
+        "lecture": (
+            f"Confluence : {bull}/4 haussières contre {bear}/4 baissières. "
+            f"H4 : {h4} | H1 : {h1} | M30 : {m30}. "
+            f"Prix vs EMA 50 : {price_vs_50}. FVG : {fvg}."
+        ),
+        "zones": zones
+    }
 
 
 # =========================================================
@@ -909,6 +998,9 @@ if instruments_config:
             "H1": analysis["H1"],
             "M30": analysis["M30"],
             "FVG M30": analysis["FVG"],
+            "FVG actifs M30": analysis["FVG_actifs"],
+            "Zones FVG actives": analysis["Zones_FVG_actives"],
+            "Assistant": build_decision_assistant(analysis)["verdict"],
             "Score haussier": analysis["bullish_score"],
             "Score baissier": analysis["bearish_score"],
             "Décision": analysis["decision"],
@@ -969,7 +1061,8 @@ for config in instruments_config:
 
         df, events = detect_market_structure(df)
 
-        gaps = detect_fvg(df)
+        # Affichage et historique : FVG actifs uniquement
+        gaps = get_active_fvgs(df)
 
         current_price = get_current_price(pair)
 
@@ -1055,8 +1148,27 @@ for config in instruments_config:
         with col4:
 
             st.metric(
-                "FVG détectés",
+                "FVG actifs",
                 len(gaps)
+            )
+
+        # ---------------------------------------------
+        # ASSISTANT DE DÉCISION
+        # ---------------------------------------------
+
+        assistant_analysis = get_confluence_analysis(pair)
+        assistant = build_decision_assistant(assistant_analysis)
+
+        with st.container(border=True):
+            st.subheader("Assistant de décision")
+            st.markdown(f"**{assistant['verdict']}**")
+            st.write(assistant["lecture"])
+            st.markdown(f"**Confirmation à attendre :** {assistant['confirmation']}")
+            st.markdown(f"**Invalidation / prudence :** {assistant['invalidation']}")
+            st.caption(f"Zones FVG M30 actives : {assistant['zones']}")
+            st.caption(
+                "Assistant informatif : aucune entrée, aucun stop-loss et aucun ordre "
+                "ne sont générés automatiquement. Valide toujours le graphique."
             )
 
         # ---------------------------------------------
@@ -1111,7 +1223,7 @@ for config in instruments_config:
         # HISTORIQUE FVG
         # ---------------------------------------------
 
-        with st.expander("Voir les derniers Fair Value Gaps"):
+        with st.expander("Voir les FVG actifs uniquement"):
 
             if gaps:
 
@@ -1131,7 +1243,7 @@ for config in instruments_config:
 
             else:
 
-                st.write("Aucun FVG détecté.")
+                st.write("Aucun FVG actif : les zones détectées ont été comblées ou aucune zone ne subsiste.")
 
         # ---------------------------------------------
         # HISTORIQUE BOS / CHoCH
