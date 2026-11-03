@@ -284,7 +284,7 @@ def send_entry_email(subject, body, recipient):
 # =========================================================
 
 @st.cache_data(ttl=45)
-def get_data(pair, timeframe="M30", count=300):
+def get_data(pair, timeframe="M30", count=300, include_incomplete=False):
 
     request = instruments.InstrumentsCandles(
         instrument=pair,
@@ -299,10 +299,13 @@ def get_data(pair, timeframe="M30", count=300):
 
     candles = request.response["candles"]
 
-    candles = [
-        c for c in candles
-        if c.get("complete", False)
-    ]
+    # Par défaut, l'analyse utilise uniquement les bougies clôturées.
+    # Le graphique peut demander la dernière bougie encore en formation.
+    if not include_incomplete:
+        candles = [
+            c for c in candles
+            if c.get("complete", False)
+        ]
 
     df = pd.DataFrame([
         {
@@ -1452,10 +1455,20 @@ for config in instruments_config:
 
     try:
 
+        # Données clôturées : utilisées pour les indicateurs, BOS/CHoCH,
+        # FVG et décisions afin d'éviter les faux signaux intrabougie.
         df = get_data(
             pair,
             timeframe,
             CANDLE_COUNT
+        )
+
+        # Données incluant la bougie en formation : réservées à l'affichage.
+        chart_df = get_data(
+            pair,
+            timeframe,
+            CANDLE_COUNT,
+            include_incomplete=True
         )
 
         if df.empty or len(df) < 210:
@@ -1469,6 +1482,11 @@ for config in instruments_config:
         df = calculate_indicators(df)
 
         df, events = detect_market_structure(df)
+
+        if not chart_df.empty:
+            chart_df = calculate_indicators(chart_df)
+        else:
+            chart_df = df.copy()
 
         # Affichage et historique : FVG actifs uniquement
         gaps = get_active_fvgs(df)
@@ -1704,7 +1722,7 @@ for config in instruments_config:
         # ---------------------------------------------
 
         fig = create_chart(
-            df,
+            chart_df,
             gaps,
             events,
             timeframe,
@@ -1712,6 +1730,23 @@ for config in instruments_config:
             show_fvg,
             show_structure
         )
+
+        latest_chart_time = chart_df["time"].iloc[-1]
+        latest_closed_time = df["time"].iloc[-1]
+
+        if latest_chart_time > latest_closed_time:
+            st.caption(
+                f"🟡 Bougie en formation depuis "
+                f"{latest_chart_time.strftime('%H:%M')} — "
+                "elle évolue avec les actualisations du tableau. "
+                "Les signaux restent calculés sur les bougies clôturées."
+            )
+        else:
+            st.caption(
+                f"Dernière bougie clôturée : "
+                f"{latest_closed_time.strftime('%H:%M')} — "
+                "aucune bougie active retournée par OANDA pour le moment."
+            )
 
         st.plotly_chart(
             fig,
@@ -1808,4 +1843,3 @@ st.caption(
     f"Dernière mise à jour : "
     f"{now.strftime('%Y-%m-%d %H:%M:%S')} NY"
 )
-
