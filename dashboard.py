@@ -782,6 +782,10 @@ def get_confluence_analysis(pair):
         "Plan_target_method": "N/D",
         "Plan_fvg_zone": "Aucune",
         "Plan_status": "Niveaux indisponibles",
+        "Alerte_autorisee": False,
+        "Raisons_blocage_alerte": [],
+        "Distance_entree_atr": None,
+        "Support_resistance_proche": None,
         "score": 0,
         "bullish_score": 0,
         "bearish_score": 0,
@@ -1013,6 +1017,114 @@ def get_confluence_analysis(pair):
         result["Plan_fvg_zone"] = trade_plan["fvg_zone"]
         result["Plan_status"] = trade_plan["status"]
 
+        # Filtres stricts avant toute alerte.
+        block_reasons = []
+        alert_direction = trade_direction
+
+        if alert_direction:
+            expected_bias = "Baissière" if alert_direction == "SHORT" else "Haussière"
+            expected_structure = -1 if alert_direction == "SHORT" else 1
+
+            if h4_direction != expected_bias:
+                block_reasons.append(f"Tendance H4 non alignée ({h4_direction})")
+
+            latest_h1_event = events_h1[-1] if events_h1 else None
+            if (
+                latest_h1_event is None
+                or latest_h1_event.get("direction") != expected_structure
+                or latest_h1_event.get("type") not in ("BOS", "CHoCH")
+                or (len(df_h1) - 1 - latest_h1_event.get("index", -999)) > 30
+            ):
+                block_reasons.append("Structure H1 absente, opposée ou trop ancienne")
+
+            latest_m30_event = events_m30[-1] if events_m30 else None
+            if (
+                latest_m30_event is None
+                or latest_m30_event.get("direction") != expected_structure
+                or latest_m30_event.get("type") not in ("BOS", "CHoCH")
+                or (len(df_m30) - 1 - latest_m30_event.get("index", -999)) > 20
+            ):
+                block_reasons.append("Structure M30 absente, opposée ou trop ancienne")
+
+            required_rejection = "Baissier" if alert_direction == "SHORT" else "Haussier"
+            if result["Rejet_M30"] != required_rejection:
+                block_reasons.append("Rejet M30 confirmé manquant")
+
+            if trade_plan["entry"] is None or trade_plan["stop_loss"] is None:
+                block_reasons.append("Niveaux d'entrée/stop indisponibles")
+            else:
+                prev_close = df_m30["close"].shift(1)
+                true_range = pd.concat(
+                    [
+                        df_m30["high"] - df_m30["low"],
+                        (df_m30["high"] - prev_close).abs(),
+                        (df_m30["low"] - prev_close).abs()
+                    ],
+                    axis=1
+                ).max(axis=1)
+                atr_alert = float(true_range.tail(14).mean())
+                entry_distance_atr = (
+                    abs(float(current_price) - float(trade_plan["entry"])) / atr_alert
+                    if atr_alert > 0 else float("inf")
+                )
+                result["Distance_entree_atr"] = entry_distance_atr
+
+                if entry_distance_atr > 1.0:
+                    block_reasons.append(
+                        "Prix trop éloigné de l'entrée théorique (plus de 1 ATR)"
+                    )
+
+                # Exiger une cible basée sur un vrai pivot, pas une projection 2R.
+                if "Prochain swing" not in trade_plan["target_method"]:
+                    block_reasons.append(
+                        "Aucun support/résistance structurel utilisable comme cible"
+                    )
+
+                recent_alert = df_m30.tail(120).copy()
+                highs_alert = recent_alert["high"].astype(float)
+                lows_alert = recent_alert["low"].astype(float)
+                swing_high_mask = highs_alert.eq(highs_alert.rolling(5, center=True).max())
+                swing_low_mask = lows_alert.eq(lows_alert.rolling(5, center=True).min())
+
+                if alert_direction == "SHORT":
+                    supports = lows_alert[
+                        swing_low_mask & (lows_alert < float(current_price))
+                    ].dropna()
+                    nearest_level = float(supports.max()) if not supports.empty else None
+                    result["Support_resistance_proche"] = nearest_level
+                    if nearest_level is None:
+                        block_reasons.append("Aucun support M30 identifiable sous le prix")
+                    else:
+                        risk_distance = float(trade_plan["stop_loss"]) - float(trade_plan["entry"])
+                        free_space = float(current_price) - nearest_level
+                        if free_space < risk_distance * 1.5:
+                            block_reasons.append(
+                                "Prix trop proche d'un support M30 : vente bloquée"
+                            )
+                else:
+                    resistances = highs_alert[
+                        swing_high_mask & (highs_alert > float(current_price))
+                    ].dropna()
+                    nearest_level = float(resistances.min()) if not resistances.empty else None
+                    result["Support_resistance_proche"] = nearest_level
+                    if nearest_level is None:
+                        block_reasons.append(
+                            "Aucune résistance M30 identifiable au-dessus du prix"
+                        )
+                    else:
+                        risk_distance = float(trade_plan["entry"]) - float(trade_plan["stop_loss"])
+                        free_space = nearest_level - float(current_price)
+                        if free_space < risk_distance * 1.5:
+                            block_reasons.append(
+                                "Prix trop proche d'une résistance M30 : achat bloqué"
+                            )
+
+            if trade_plan["rr"] is None or trade_plan["rr"] < 1.5:
+                block_reasons.append("Ratio risque/rendement inférieur à 1:1,5")
+
+        result["Raisons_blocage_alerte"] = block_reasons
+        result["Alerte_autorisee"] = bool(alert_direction and not block_reasons)
+
     except Exception as e:
         result["details"] = str(e)
 
@@ -1136,6 +1248,11 @@ def trigger_confirmed_entry_alert(pair, label, analysis):
     présent et que le plan offre au moins 1,5R avec des niveaux calculés.
     """
     setup = analysis.get("Setup_M30")
+
+    # Les alertes sont bloquées tant que tous les filtres renforcés ne passent pas.
+    if not analysis.get("Alerte_autorisee", False):
+        return
+
     if setup == "ACHAT À VALIDER":
         direction = "ACHAT"
         voice = VOICE_STRONG_BULL
@@ -1588,6 +1705,14 @@ for config in instruments_config:
 
         trigger_confirmed_entry_alert(pair, label, assistant_analysis)
 
+        blocked_reasons = assistant_analysis.get("Raisons_blocage_alerte", [])
+        if blocked_reasons and assistant_analysis.get("Setup_M30") in (
+            "ACHAT À VALIDER", "VENTE À VALIDER"
+        ):
+            with st.expander("Pourquoi aucune alerte n'a été envoyée?"):
+                for reason in blocked_reasons:
+                    st.write(f"• {reason}")
+
         with st.container(border=True):
             st.subheader("Assistant de décision")
             st.markdown(f"**{assistant['verdict']}**")
@@ -1843,3 +1968,4 @@ st.caption(
     f"Dernière mise à jour : "
     f"{now.strftime('%Y-%m-%d %H:%M:%S')} NY"
 )
+
