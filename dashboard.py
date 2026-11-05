@@ -757,461 +757,280 @@ def calculate_trade_levels(df_m30, active_gaps, direction, current_price, select
     return result
 
 
-def get_confluence_analysis(pair):
+def calculate_atr(df, period=14):
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    value = float(tr.tail(period).mean())
+    return value if pd.notna(value) and value > 0 else 0.0
 
-    result = {
-        "Prix": "N/D",
-        "EMA50": "N/D",
-        "EMA100": "N/D",
-        "EMA200": "N/D",
-        "Prix_vs_EMA50": "N/D",
-        "Prix_vs_EMA100": "N/D",
-        "Prix_vs_EMA200": "N/D",
-        "H4": "N/D",
-        "H1": "N/D",
-        "M30": "N/D",
-        "FVG": "Aucun",
-        "FVG_actifs": 0,
-        "Zones_FVG_actives": "Aucune",
-        "Setup_M30": "En attente",
-        "Prix_dans_FVG": "Non",
-        "Rejet_M30": "Aucun",
-        "Plan_direction": "N/D",
-        "Plan_entree": None,
-        "Plan_stop": None,
-        "Plan_tp": None,
-        "Plan_rr": None,
-        "Plan_target_method": "N/D",
-        "Plan_fvg_zone": "Aucune",
-        "Plan_status": "Niveaux indisponibles",
-        "Alerte_autorisee": False,
-        "Raisons_blocage_alerte": [],
-        "Distance_entree_atr": None,
-        "Support_resistance_proche": None,
-        "score": 0,
-        "bullish_score": 0,
-        "bearish_score": 0,
-        "decision": "ATTENTE",
-        "details": ""
+
+def detect_supply_demand_zones(df, lookback=100):
+    """Repère des zones M30 à partir de pivots confirmés suivis d'un déplacement.
+    Les pivots sont confirmés avec deux bougies à droite : pas de pivot futur utilisé.
+    """
+    if len(df) < 20:
+        return {"demand": None, "supply": None}
+
+    data = df.tail(lookback).reset_index(drop=True).copy()
+    atr = calculate_atr(data)
+    if atr <= 0:
+        return {"demand": None, "supply": None}
+
+    demand_candidates, supply_candidates = [], []
+    for i in range(2, len(data) - 4):
+        pivot_low = float(data.loc[i, "low"])
+        pivot_high = float(data.loc[i, "high"])
+        is_low = pivot_low <= float(data.loc[i-2:i+2, "low"].min())
+        is_high = pivot_high >= float(data.loc[i-2:i+2, "high"].max())
+        future = data.iloc[i+1:i+5]
+        if future.empty:
+            continue
+        # Une zone n'est retenue que si elle a provoqué un déplacement notable.
+        if is_low and float(future["high"].max()) - pivot_low >= 0.8 * atr:
+            base_low = min(float(data.loc[i, "low"]), float(data.loc[i, "open"]), float(data.loc[i, "close"]))
+            base_high = max(float(data.loc[i, "open"]), float(data.loc[i, "close"]))
+            demand_candidates.append({"bottom": base_low, "top": max(base_high, base_low + 0.12 * atr), "index": i})
+        if is_high and pivot_high - float(future["low"].min()) >= 0.8 * atr:
+            base_high = max(float(data.loc[i, "high"]), float(data.loc[i, "open"]), float(data.loc[i, "close"]))
+            base_low = min(float(data.loc[i, "open"]), float(data.loc[i, "close"]))
+            supply_candidates.append({"bottom": min(base_low, base_high - 0.12 * atr), "top": base_high, "index": i})
+
+    def latest_valid(candidates, kind):
+        for zone in reversed(candidates):
+            later = data.iloc[zone["index"] + 1:]
+            if kind == "demand":
+                # Zone invalidée seulement après deux clôtures consécutives sous le bas.
+                closes = later["close"].astype(float).tail(2).tolist()
+                broken = any(
+                    float(later["close"].iloc[j]) < zone["bottom"]
+                    and float(later["close"].iloc[j + 1]) < zone["bottom"]
+                    for j in range(0, max(0, len(later) - 1))
+                )
+                if broken:
+                    continue
+            else:
+                closes = later["close"].astype(float).tail(2).tolist()
+                broken = any(
+                    float(later["close"].iloc[j]) > zone["top"]
+                    and float(later["close"].iloc[j + 1]) > zone["top"]
+                    for j in range(0, max(0, len(later) - 1))
+                )
+                if broken:
+                    continue
+            return zone
+        return None
+
+    return {
+        "demand": latest_valid(demand_candidates, "demand"),
+        "supply": latest_valid(supply_candidates, "supply")
     }
 
-    try:
 
+def calculate_zone_trade_plan(df, zone, direction, current_price):
+    """Plan indicatif basé sur une zone S/D. Pas d'ordre envoyé."""
+    out = {"entry": None, "stop": None, "target": None, "rr": None,
+           "status": "Niveaux indisponibles", "distance_atr": None,
+           "zone_text": "Aucune", "target_method": "N/D"}
+    if zone is None or len(df) < 20:
+        return out
+    atr = calculate_atr(df)
+    if atr <= 0:
+        return out
+    bottom, top = float(zone["bottom"]), float(zone["top"])
+    entry = (bottom + top) / 2
+    buffer = max(atr * 0.12, abs(entry) * 0.0001)
+    recent = df.tail(100).iloc[:-2]
+    if direction == "LONG":
+        stop = bottom - buffer
+        candidates = recent.loc[recent["high"] > entry, "high"].astype(float)
+        candidates = candidates[candidates >= entry + (entry-stop)*1.5]
+        target = float(candidates.min()) if not candidates.empty else entry + (entry-stop)*2
+        risk, reward = entry-stop, target-entry
+        distance = (float(current_price)-entry)/atr
+    else:
+        stop = top + buffer
+        candidates = recent.loc[recent["low"] < entry, "low"].astype(float)
+        candidates = candidates[candidates <= entry - (stop-entry)*1.5]
+        target = float(candidates.max()) if not candidates.empty else entry - (stop-entry)*2
+        risk, reward = stop-entry, entry-target
+        distance = (entry-float(current_price))/atr
+    rr_value = reward/risk if risk > 0 else None
+    if direction == "LONG":
+        if current_price > entry + 0.65*atr:
+            status = "OCCASION DÉPASSÉE — attendre un nouveau retest"
+        elif current_price < bottom - buffer:
+            status = "ZONE INVALIDÉE"
+        else:
+            status = "ENTRÉE ACCESSIBLE À VALIDER" if abs(distance) <= 0.65 else "ATTENDRE LE RETOUR DANS LA ZONE"
+    else:
+        if current_price < entry - 0.65*atr:
+            status = "OCCASION DÉPASSÉE — attendre un nouveau retest"
+        elif current_price > top + buffer:
+            status = "ZONE INVALIDÉE"
+        else:
+            status = "ENTRÉE ACCESSIBLE À VALIDER" if abs(distance) <= 0.65 else "ATTENDRE LE RETOUR DANS LA ZONE"
+    if rr_value is not None and rr_value < 1.5:
+        status = "R/R INSUFFISANT"
+    out.update({"entry": entry, "stop": stop, "target": target, "rr": rr_value,
+                "status": status, "distance_atr": abs(distance),
+                "zone_text": f"{bottom:.5f} à {top:.5f}",
+                "target_method": "Pivot M30" if not candidates.empty else "Projection 2R (indicative)"})
+    return out
+
+
+def get_confluence_analysis(pair):
+    result = {
+        "Prix": "N/D", "EMA50": "N/D", "EMA100": "N/D", "EMA200": "N/D",
+        "Prix_vs_EMA50": "N/D", "Prix_vs_EMA100": "N/D", "Prix_vs_EMA200": "N/D",
+        "H4": "N/D", "H1": "N/D", "M30": "N/D", "FVG": "Aucun",
+        "FVG_actifs": 0, "Zones_FVG_actives": "Aucune", "Setup_M30": "En attente",
+        "Prix_dans_FVG": "Non", "Rejet_M30": "Aucun", "Plan_direction": "N/D",
+        "Plan_entree": None, "Plan_stop": None, "Plan_tp": None, "Plan_rr": None,
+        "Plan_target_method": "N/D", "Plan_fvg_zone": "Aucune", "Plan_status": "Niveaux indisponibles",
+        "Alerte_autorisee": False, "Raisons_blocage_alerte": [], "Distance_entree_atr": None,
+        "Support_resistance_proche": None, "score": 0, "bullish_score": 0,
+        "bearish_score": 0, "decision": "ATTENTE", "details": "",
+        "Demand_zone": None, "Supply_zone": None, "Scenario_achat": "Aucun setup",
+        "Scenario_vente": "Aucun setup", "Scenario_actif": "ATTENDRE"
+    }
+    try:
         df_h4 = get_data(pair, "H4", CANDLE_COUNT)
         df_h1 = get_data(pair, "H1", CANDLE_COUNT)
         df_m30 = get_data(pair, "M30", CANDLE_COUNT)
-
-        if (
-            len(df_h4) < 210
-            or len(df_h1) < 210
-            or len(df_m30) < 210
-        ):
+        if min(len(df_h4), len(df_h1), len(df_m30)) < 210:
             result["details"] = "Données insuffisantes"
             return result
-
-        df_h4 = calculate_indicators(df_h4)
-        df_h1 = calculate_indicators(df_h1)
-        df_m30 = calculate_indicators(df_m30)
-
+        df_h4, df_h1, df_m30 = map(calculate_indicators, (df_h4, df_h1, df_m30))
         df_h1, events_h1 = detect_market_structure(df_h1)
         df_m30, events_m30 = detect_market_structure(df_m30)
-
-        # Prix actuel obtenu sur M1
         current_price = get_current_price(pair)
-
         if current_price is None:
-            current_price = float(df_h4["close"].iloc[-1])
-
-        # EMA H4
+            current_price = float(df_m30["close"].iloc[-1])
+        result["Prix"] = float(current_price)
         last_h4 = df_h4.iloc[-1]
+        for n in (50, 100, 200):
+            result[f"EMA{n}"] = float(last_h4[f"EMA{n}"])
+            result[f"Prix_vs_EMA{n}"] = "Au-dessus" if current_price > last_h4[f"EMA{n}"] else "En dessous"
+        h4 = get_ema_direction(df_h4)
+        h1 = get_structure_bias(events_h1, len(df_h1), max_age=12)
+        m30 = get_structure_bias(events_m30, len(df_m30), max_age=8)
+        result.update({"H4": h4, "H1": h1, "M30": m30})
 
-        ema50 = float(last_h4["EMA50"])
-        ema100 = float(last_h4["EMA100"])
-        ema200 = float(last_h4["EMA200"])
+        gaps = get_active_fvgs(df_m30)
+        bull_gaps = [g for g in gaps if g["type"] == "Bullish FVG"]
+        bear_gaps = [g for g in gaps if g["type"] == "Bearish FVG"]
+        fvg = "Mixte" if bull_gaps and bear_gaps else "Haussier" if bull_gaps else "Baissier" if bear_gaps else "Aucun"
+        result["FVG"] = fvg
+        result["FVG_actifs"] = len(gaps)
+        result["Zones_FVG_actives"] = " | ".join(f'{g["type"]}: {g["bottom"]:.5f}-{g["top"]:.5f}' for g in gaps[-4:]) or "Aucune"
 
-        result["Prix"] = current_price
-        result["EMA50"] = ema50
-        result["EMA100"] = ema100
-        result["EMA200"] = ema200
+        zones = detect_supply_demand_zones(df_m30)
+        demand, supply = zones["demand"], zones["supply"]
+        result["Demand_zone"] = demand
+        result["Supply_zone"] = supply
+        atr = calculate_atr(df_m30)
+        last = df_m30.iloc[-1]
+        prev = df_m30.iloc[-2]
+        demand_near = bool(demand and float(current_price) >= demand["bottom"] - 0.15*atr and float(current_price) <= demand["top"] + 1.5*atr)
+        supply_near = bool(supply and float(current_price) <= supply["top"] + 0.15*atr and float(current_price) >= supply["bottom"] - 1.5*atr)
+        demand_broken = bool(demand and len(df_m30) >= 3 and all(float(v) < demand["bottom"] for v in df_m30["close"].tail(2)))
+        supply_broken = bool(supply and len(df_m30) >= 3 and all(float(v) > supply["top"] for v in df_m30["close"].tail(2)))
 
-        result["Prix_vs_EMA50"] = (
-            "Au-dessus" if current_price > ema50 else "En dessous"
+        # Rejet réel sur la zone: la bougie clôturée touche la zone et clôture hors de celle-ci.
+        bull_zone_rejection = bool(demand and float(last["low"]) <= demand["top"] and float(last["close"]) > demand["top"] and float(last["close"]) > float(last["open"]))
+        bear_zone_rejection = bool(supply and float(last["high"]) >= supply["bottom"] and float(last["close"]) < supply["bottom"] and float(last["close"]) < float(last["open"]))
+        bull_fvg_rejection = any(
+            float(last["low"]) <= g["top"] and float(last["high"]) >= g["bottom"]
+            and float(last["close"]) > float(last["open"]) and float(last["close"]) > g["top"]
+            for g in bull_gaps
         )
-
-        result["Prix_vs_EMA100"] = (
-            "Au-dessus" if current_price > ema100 else "En dessous"
+        bear_fvg_rejection = any(
+            float(last["low"]) <= g["top"] and float(last["high"]) >= g["bottom"]
+            and float(last["close"]) < float(last["open"]) and float(last["close"]) < g["bottom"]
+            for g in bear_gaps
         )
+        recent_bull_structure = bool(events_m30 and events_m30[-1]["direction"] == 1 and len(df_m30)-1-events_m30[-1]["index"] <= 8)
+        recent_bear_structure = bool(events_m30 and events_m30[-1]["direction"] == -1 and len(df_m30)-1-events_m30[-1]["index"] <= 8)
 
-        result["Prix_vs_EMA200"] = (
-            "Au-dessus" if current_price > ema200 else "En dessous"
-        )
+        # Un support/demande défendu interdit une vente tant qu'il n'est pas cassé par 2 clôtures.
+        block_short_at_demand = demand_near and not demand_broken
+        block_long_at_supply = supply_near and not supply_broken
+        buy_confirmed = (bull_zone_rejection or bull_fvg_rejection) and recent_bull_structure and not block_long_at_supply
+        sell_confirmed = (bear_zone_rejection or bear_fvg_rejection) and recent_bear_structure and not block_short_at_demand
 
-        # Tendances
-        h4_direction = get_ema_direction(df_h4)
+        # Confluence est informative; elle ne remplace plus le déclencheur de prix.
+        bull_score = sum([h4 == "Haussière", h1 == "Haussière", m30 == "Haussière", fvg == "Haussier"])
+        bear_score = sum([h4 == "Baissière", h1 == "Baissière", m30 == "Baissière", fvg == "Baissier"])
+        result["bullish_score"], result["bearish_score"] = int(bull_score), int(bear_score)
+        result["score"] = max(bull_score, bear_score)
+        result["decision"] = "ATTENTE" if buy_confirmed and sell_confirmed else "ACHAT POTENTIEL" if buy_confirmed else "VENTE POTENTIELLE" if sell_confirmed else "ATTENTE"
+        result["Rejet_M30"] = "Haussier" if buy_confirmed else "Baissier" if sell_confirmed else "Aucun"
+        buy_source = "FVG haussier" if bull_fvg_rejection and not bull_zone_rejection else "demande" 
+        sell_source = "FVG baissier" if bear_fvg_rejection and not bear_zone_rejection else "offre"
+        result["Scenario_achat"] = f"ACHAT À SURVEILLER — rejet {buy_source} + structure" if buy_confirmed else "Demande défendue : attendre confirmation" if demand_near and not demand_broken else "Aucune confirmation acheteuse"
+        result["Scenario_vente"] = f"VENTE À SURVEILLER — rejet {sell_source} + structure" if sell_confirmed else "Offre à surveiller" if supply_near and not supply_broken else "Aucune confirmation vendeuse"
+        result["Scenario_actif"] = "ACHAT À SURVEILLER" if buy_confirmed else "VENTE À SURVEILLER" if sell_confirmed else "ATTENDRE — scénarios contradictoires ou incomplets"
+        result["Setup_M30"] = "ACHAT À VALIDER" if buy_confirmed else "VENTE À VALIDER" if sell_confirmed else "ATTENDRE — zone, rejet et structure non alignés"
+        result["details"] = f"{bull_score}/4 haussières contre {bear_score}/4 baissières; déclencheur S/D indépendant du score."
 
-        h1_direction = get_structure_bias(
-            events_h1,
-            len(df_h1)
-        )
-
-        m30_direction = get_structure_bias(
-            events_m30,
-            len(df_m30)
-        )
-
-        result["H4"] = h4_direction
-        result["H1"] = h1_direction
-        result["M30"] = m30_direction
-
-        # FVG actifs
-        active_gaps = get_active_fvgs(df_m30)
-
-        bullish_fvg = any(
-            gap["type"] == "Bullish FVG"
-            for gap in active_gaps
-        )
-
-        bearish_fvg = any(
-            gap["type"] == "Bearish FVG"
-            for gap in active_gaps
-        )
-
-        if bullish_fvg and bearish_fvg:
-            fvg_direction = "Mixte"
-        elif bullish_fvg:
-            fvg_direction = "Haussier"
-        elif bearish_fvg:
-            fvg_direction = "Baissier"
-        else:
-            fvg_direction = "Aucun"
-
-        result["FVG"] = fvg_direction
-        result["FVG_actifs"] = len(active_gaps)
-
-        if active_gaps:
-            zone_descriptions = []
-            for gap in active_gaps[-5:]:
-                zone_descriptions.append(
-                    f'{gap["type"]}: {gap["bottom"]:.5f} à {gap["top"]:.5f}'
-                )
-            result["Zones_FVG_actives"] = " | ".join(zone_descriptions)
-
-        # Validation du retour dans un FVG et du rejet sur la dernière M30 complète.
-        last_m30 = df_m30.iloc[-1]
-        result["M30_candle_time"] = str(last_m30["time"])
-        price_in_bullish_fvg = False
-        price_in_bearish_fvg = False
-        bullish_rejection = False
-        bearish_rejection = False
-
-        for gap in active_gaps:
-            price_inside = gap["bottom"] <= current_price <= gap["top"]
-            candle_touched_zone = (
-                float(last_m30["low"]) <= gap["top"]
-                and float(last_m30["high"]) >= gap["bottom"]
-            )
-
-            if gap["type"] == "Bullish FVG":
-                price_in_bullish_fvg = price_in_bullish_fvg or price_inside
-                if (
-                    candle_touched_zone
-                    and float(last_m30["close"]) > float(last_m30["open"])
-                    and float(last_m30["close"]) > gap["top"]
-                ):
-                    bullish_rejection = True
-
-            elif gap["type"] == "Bearish FVG":
-                price_in_bearish_fvg = price_in_bearish_fvg or price_inside
-                if (
-                    candle_touched_zone
-                    and float(last_m30["close"]) < float(last_m30["open"])
-                    and float(last_m30["close"]) < gap["bottom"]
-                ):
-                    bearish_rejection = True
-
-        if price_in_bullish_fvg or price_in_bearish_fvg:
-            result["Prix_dans_FVG"] = "Oui"
-
-        if bullish_rejection:
-            result["Rejet_M30"] = "Haussier"
-        elif bearish_rejection:
-            result["Rejet_M30"] = "Baissier"
-
-        # Confluence
-        bullish_score = 0
-        bearish_score = 0
-
-        if h4_direction == "Haussière":
-            bullish_score += 1
-        elif h4_direction == "Baissière":
-            bearish_score += 1
-
-        if h1_direction == "Haussière":
-            bullish_score += 1
-        elif h1_direction == "Baissière":
-            bearish_score += 1
-
-        if m30_direction == "Haussière":
-            bullish_score += 1
-        elif m30_direction == "Baissière":
-            bearish_score += 1
-
-        if fvg_direction == "Haussier":
-            bullish_score += 1
-        elif fvg_direction == "Baissier":
-            bearish_score += 1
-
-        result["bullish_score"] = bullish_score
-        result["bearish_score"] = bearish_score
-        result["score"] = max(bullish_score, bearish_score)
-
-        if bullish_score >= 3 and bullish_score > bearish_score:
-            result["decision"] = "ACHAT POTENTIEL"
-            result["details"] = f"{bullish_score}/4 confirmations haussières"
-
-        elif bearish_score >= 3 and bearish_score > bullish_score:
-            result["decision"] = "VENTE POTENTIELLE"
-            result["details"] = f"{bearish_score}/4 confirmations baissières"
-
-        else:
-            result["decision"] = "ATTENTE"
-            result["details"] = "Confluence insuffisante ou contradictoire"
-
-        # La tendance seule ne constitue pas un signal d'entrée.
-        if result["decision"] == "ACHAT POTENTIEL":
-            if bullish_rejection:
-                result["Setup_M30"] = "ACHAT À VALIDER"
-            elif price_in_bullish_fvg:
-                result["Setup_M30"] = "ZONE HAUSSIÈRE ATTEINTE — attendre rejet"
-            else:
-                result["Setup_M30"] = "ATTENDRE RETOUR DANS FVG HAUSSIER"
-
-        elif result["decision"] == "VENTE POTENTIELLE":
-            if bearish_rejection:
-                result["Setup_M30"] = "VENTE À VALIDER"
-            elif price_in_bearish_fvg:
-                result["Setup_M30"] = "ZONE BAISSIÈRE ATTEINTE — attendre rejet"
-            else:
-                result["Setup_M30"] = "ATTENDRE RETOUR DANS FVG BAISSIER"
-
-        else:
-            result["Setup_M30"] = "PAS DE SETUP — confluence insuffisante"
-
-        trade_direction = None
-        if result["decision"] == "ACHAT POTENTIEL":
-            trade_direction = "LONG"
-        elif result["decision"] == "VENTE POTENTIELLE":
-            trade_direction = "SHORT"
-
-        # Revalidation stricte : le rejet doit provenir du FVG précis
-        # le plus récent dans le sens du scénario, et non de n'importe quel FVG.
-        selected_gap = None
-        exact_rejection = None
-        if trade_direction:
-            wanted_type = "Bullish FVG" if trade_direction == "LONG" else "Bearish FVG"
-            fresh_matching = [
-                gap for gap in active_gaps
-                if gap.get("type") == wanted_type
-                and len(df_m30) - 1 - gap.get("index", -9999) <= 40
-            ]
-            if fresh_matching:
-                candidate_gap = fresh_matching[-1]
-                candle_touched = (
-                    float(last_m30["low"]) <= float(candidate_gap["top"])
-                    and float(last_m30["high"]) >= float(candidate_gap["bottom"])
-                )
-                if trade_direction == "LONG":
-                    valid_rejection = (
-                        candle_touched
-                        and float(last_m30["close"]) > float(last_m30["open"])
-                        and float(last_m30["close"]) > float(candidate_gap["top"])
-                    )
-                    if valid_rejection:
-                        exact_rejection = "Haussier"
+        direction = "LONG" if buy_confirmed and not sell_confirmed else "SHORT" if sell_confirmed and not buy_confirmed else None
+        zone = demand if direction == "LONG" else supply if direction == "SHORT" else None
+        plan = calculate_zone_trade_plan(df_m30, zone, direction, float(current_price)) if direction and zone else {}
+        if direction and zone is None:
+            matching = bull_gaps if direction == "LONG" else bear_gaps
+            selected_gap = matching[-1] if matching else None
+            old_plan = calculate_trade_levels(df_m30, gaps, direction, float(current_price), selected_gap=selected_gap)
+            if old_plan.get("entry") is not None:
+                atr_now = calculate_atr(df_m30)
+                dist = abs(float(current_price) - float(old_plan["entry"])) / atr_now if atr_now else 999
+                if direction == "LONG":
+                    status = "OCCASION DÉPASSÉE — attendre un nouveau retest" if current_price > old_plan["entry"] + 0.65*atr_now else "ENTRÉE ACCESSIBLE À VALIDER"
                 else:
-                    valid_rejection = (
-                        candle_touched
-                        and float(last_m30["close"]) < float(last_m30["open"])
-                        and float(last_m30["close"]) < float(candidate_gap["bottom"])
-                    )
-                    if valid_rejection:
-                        exact_rejection = "Baissier"
+                    status = "OCCASION DÉPASSÉE — attendre un nouveau retest" if current_price < old_plan["entry"] - 0.65*atr_now else "ENTRÉE ACCESSIBLE À VALIDER"
+                plan = {"entry": old_plan["entry"], "stop": old_plan["stop_loss"], "target": old_plan["take_profit"],
+                        "rr": old_plan["rr"], "status": status if old_plan["rr"] and old_plan["rr"] >= 1.5 else "R/R INSUFFISANT",
+                        "distance_atr": dist, "zone_text": old_plan["fvg_zone"], "target_method": old_plan["target_method"]}
+        if plan:
+            result.update({"Plan_direction": direction, "Plan_entree": plan.get("entry"), "Plan_stop": plan.get("stop"),
+                           "Plan_tp": plan.get("target"), "Plan_rr": plan.get("rr"), "Plan_target_method": plan.get("target_method", "N/D"),
+                           "Plan_fvg_zone": plan.get("zone_text", "Aucune"), "Plan_status": plan.get("status", "Niveaux indisponibles"), "Distance_entree_atr": plan.get("distance_atr")})
 
-                if valid_rejection:
-                    selected_gap = candidate_gap
-
-            # Une réaction récente et opposée dans un FVG neutralise le setup.
-            opposite_type = "Bearish FVG" if trade_direction == "LONG" else "Bullish FVG"
-            opposite_gaps = [
-                gap for gap in active_gaps
-                if gap.get("type") == opposite_type
-                and len(df_m30) - 1 - gap.get("index", -9999) <= 8
-            ]
-            for opposite_gap in opposite_gaps:
-                touched = (
-                    float(last_m30["low"]) <= float(opposite_gap["top"])
-                    and float(last_m30["high"]) >= float(opposite_gap["bottom"])
-                )
-                opposite_rejection = (
-                    touched
-                    and (
-                        (float(last_m30["close"]) < float(last_m30["open"])
-                         and float(last_m30["close"]) < float(opposite_gap["bottom"]))
-                        if trade_direction == "LONG"
-                        else
-                        (float(last_m30["close"]) > float(last_m30["open"])
-                         and float(last_m30["close"]) > float(opposite_gap["top"]))
-                    )
-                )
-                if opposite_rejection:
-                    selected_gap = None
-                    exact_rejection = None
-                    result["Raisons_blocage_alerte"].append(
-                        "Réaction opposée récente dans un FVG"
-                    )
-                    break
-
-        result["Rejet_M30"] = exact_rejection or "Aucun"
-        if trade_direction == "LONG":
-            result["Setup_M30"] = (
-                "ACHAT À VALIDER" if exact_rejection
-                else "ATTENDRE — retest/rejet du FVG haussier précis"
-            )
-        elif trade_direction == "SHORT":
-            result["Setup_M30"] = (
-                "VENTE À VALIDER" if exact_rejection
-                else "ATTENDRE — retest/rejet du FVG baissier précis"
-            )
-
-        trade_plan = calculate_trade_levels(
-            df_m30,
-            active_gaps,
-            trade_direction if selected_gap else None,
-            current_price,
-            selected_gap=selected_gap
-        )
-
-        result["Plan_direction"] = trade_plan["direction"] or "N/D"
-        result["Plan_entree"] = trade_plan["entry"]
-        result["Plan_stop"] = trade_plan["stop_loss"]
-        result["Plan_tp"] = trade_plan["take_profit"]
-        result["Plan_rr"] = trade_plan["rr"]
-        result["Plan_target_method"] = trade_plan["target_method"]
-        result["Plan_fvg_zone"] = trade_plan["fvg_zone"]
-        result["Plan_status"] = trade_plan["status"]
-
-        # Filtres stricts avant toute alerte.
-        block_reasons = []
-        alert_direction = trade_direction
-
-        if alert_direction:
-            expected_bias = "Baissière" if alert_direction == "SHORT" else "Haussière"
-            expected_structure = -1 if alert_direction == "SHORT" else 1
-
-            if h4_direction != expected_bias:
-                block_reasons.append(f"Tendance H4 non alignée ({h4_direction})")
-
-            latest_h1_event = events_h1[-1] if events_h1 else None
-            if (
-                latest_h1_event is None
-                or latest_h1_event.get("direction") != expected_structure
-                or latest_h1_event.get("type") not in ("BOS", "CHoCH")
-                or (len(df_h1) - 1 - latest_h1_event.get("index", -999)) > 12
-            ):
-                block_reasons.append("Structure H1 absente, opposée ou trop ancienne")
-
-            latest_m30_event = events_m30[-1] if events_m30 else None
-            if (
-                latest_m30_event is None
-                or latest_m30_event.get("direction") != expected_structure
-                or latest_m30_event.get("type") not in ("BOS", "CHoCH")
-                or (len(df_m30) - 1 - latest_m30_event.get("index", -999)) > 8
-            ):
-                block_reasons.append("Structure M30 absente, opposée ou trop ancienne")
-
-            required_rejection = "Baissier" if alert_direction == "SHORT" else "Haussier"
-            if result["Rejet_M30"] != required_rejection:
-                block_reasons.append("Rejet M30 confirmé manquant")
-
-            if trade_plan["entry"] is None or trade_plan["stop_loss"] is None:
-                block_reasons.append("Niveaux d'entrée/stop indisponibles")
-            else:
-                prev_close = df_m30["close"].shift(1)
-                true_range = pd.concat(
-                    [
-                        df_m30["high"] - df_m30["low"],
-                        (df_m30["high"] - prev_close).abs(),
-                        (df_m30["low"] - prev_close).abs()
-                    ],
-                    axis=1
-                ).max(axis=1)
-                atr_alert = float(true_range.tail(14).mean())
-                entry_distance_atr = (
-                    abs(float(current_price) - float(trade_plan["entry"])) / atr_alert
-                    if atr_alert > 0 else float("inf")
-                )
-                result["Distance_entree_atr"] = entry_distance_atr
-
-                if entry_distance_atr > 1.0:
-                    block_reasons.append(
-                        "Prix trop éloigné de l'entrée théorique (plus de 1 ATR)"
-                    )
-
-                # Exiger une cible basée sur un vrai pivot, pas une projection 2R.
-                if "Prochain swing" not in trade_plan["target_method"]:
-                    block_reasons.append(
-                        "Aucun support/résistance structurel utilisable comme cible"
-                    )
-
-                recent_alert = df_m30.tail(120).copy()
-                highs_alert = recent_alert["high"].astype(float)
-                lows_alert = recent_alert["low"].astype(float)
-                swing_high_mask = highs_alert.eq(highs_alert.rolling(5, center=True).max())
-                swing_low_mask = lows_alert.eq(lows_alert.rolling(5, center=True).min())
-
-                if alert_direction == "SHORT":
-                    supports = lows_alert[
-                        swing_low_mask & (lows_alert < float(current_price))
-                    ].dropna()
-                    nearest_level = float(supports.max()) if not supports.empty else None
-                    result["Support_resistance_proche"] = nearest_level
-                    if nearest_level is None:
-                        block_reasons.append("Aucun support M30 identifiable sous le prix")
-                    else:
-                        risk_distance = float(trade_plan["stop_loss"]) - float(trade_plan["entry"])
-                        free_space = float(current_price) - nearest_level
-                        if free_space < risk_distance * 1.5:
-                            block_reasons.append(
-                                "Prix trop proche d'un support M30 : vente bloquée"
-                            )
-                else:
-                    resistances = highs_alert[
-                        swing_high_mask & (highs_alert > float(current_price))
-                    ].dropna()
-                    nearest_level = float(resistances.min()) if not resistances.empty else None
-                    result["Support_resistance_proche"] = nearest_level
-                    if nearest_level is None:
-                        block_reasons.append(
-                            "Aucune résistance M30 identifiable au-dessus du prix"
-                        )
-                    else:
-                        risk_distance = float(trade_plan["entry"]) - float(trade_plan["stop_loss"])
-                        free_space = nearest_level - float(current_price)
-                        if free_space < risk_distance * 1.5:
-                            block_reasons.append(
-                                "Prix trop proche d'une résistance M30 : achat bloqué"
-                            )
-
-            if trade_plan["rr"] is None or trade_plan["rr"] < 1.5:
-                block_reasons.append("Ratio risque/rendement inférieur à 1:1,5")
-
-        result["Raisons_blocage_alerte"] = block_reasons
-        result["Alerte_autorisee"] = bool(alert_direction and not block_reasons)
-
+        blocks = []
+        if not direction:
+            if buy_confirmed and sell_confirmed:
+                blocks.append("Signaux acheteur et vendeur simultanés : attendre, aucune alerte")
+            if demand_near and not demand_broken:
+                blocks.append("Zone de demande défendue : vente bloquée tant que 2 clôtures M30 ne cassent pas son bas")
+            if supply_near and not supply_broken:
+                blocks.append("Zone d'offre défendue : achat bloqué tant que 2 clôtures M30 ne cassent pas son haut")
+            if not (bull_zone_rejection or bear_zone_rejection or bull_fvg_rejection or bear_fvg_rejection):
+                blocks.append("Aucun rejet M30 confirmé dans un FVG ou une zone d'offre/demande")
+            if not recent_bull_structure and not recent_bear_structure:
+                blocks.append("Aucun BOS/CHoCH M30 récent dans le sens du rejet")
+        else:
+            if plan.get("entry") is None:
+                blocks.append("Niveaux de risque non calculables")
+            if plan.get("status", "").startswith("OCCASION DÉPASSÉE"):
+                blocks.append("Le prix a déjà quitté la zone d'entrée : ne pas poursuivre le mouvement")
+            if plan.get("status") == "ZONE INVALIDÉE":
+                blocks.append("La zone de déclenchement est invalidée")
+            if plan.get("rr") is None or plan.get("rr", 0) < 1.5:
+                blocks.append("R/R inférieur à 1:1,5")
+            if plan.get("target_method", "").startswith("Projection"):
+                blocks.append("Cible structurelle absente : projection 2R seulement, pas d'alerte automatique")
+        result["Raisons_blocage_alerte"] = blocks
+        result["Alerte_autorisee"] = bool(direction and not blocks and plan.get("status") == "ENTRÉE ACCESSIBLE À VALIDER")
+        result["M30_candle_time"] = str(last["time"])
+        result["Prix_dans_FVG"] = "Oui" if any(g["bottom"] <= current_price <= g["top"] for g in gaps) else "Non"
+        result["Support_resistance_proche"] = demand if demand_near else supply if supply_near else None
+        return result
     except Exception as e:
-        result["details"] = str(e)
-
-    return result
+        result["details"] = f"Erreur analyse : {e}"
+        return result
 
 
 def build_decision_assistant(analysis):
@@ -1222,6 +1041,8 @@ def build_decision_assistant(analysis):
 
     decision = analysis.get("decision", "ATTENTE")
     setup = analysis.get("Setup_M30", "En attente")
+    scenario_buy = analysis.get("Scenario_achat", "Aucun setup")
+    scenario_sell = analysis.get("Scenario_vente", "Aucun setup")
     price_vs_200 = analysis.get("Prix_vs_EMA200", "N/D")
     h4 = analysis.get("H4", "N/D")
     h1 = analysis.get("H1", "N/D")
@@ -1233,18 +1054,12 @@ def build_decision_assistant(analysis):
     rejection = analysis.get("Rejet_M30", "Aucun")
 
     if decision == "ACHAT POTENTIEL":
-        if price_vs_200 != "Au-dessus":
-            verdict = "BIAIS HAUSSIER — ATTENDRE"
-            confirmation = (
-                "Le prix n'est pas au-dessus de l'EMA 200 H4. "
-                "Attendre une reprise confirmée au-dessus de cette moyenne."
-            )
-        elif setup == "ACHAT À VALIDER":
+        if setup == "ACHAT À VALIDER":
             verdict = "CONFIGURATION D'ACHAT — VALIDATION MANUELLE"
             confirmation = (
-                "Un FVG haussier actif a été retesté et la dernière bougie M30 "
-                "montre un rejet haussier. Vérifier le contexte, le stop-loss "
-                "et le ratio risque/rendement avant toute décision."
+                "La zone de demande a été rejetée à la hausse et la structure M30 "
+                "confirme le mouvement. L'EMA 200 H4 sert de contexte, pas de veto. "
+                "Vérifier l'accessibilité de l'entrée, le stop et le R/R."
             )
         elif setup.startswith("ZONE HAUSSIÈRE"):
             verdict = "ZONE D'ACHAT ATTEINTE — ATTENDRE"
@@ -1264,18 +1079,12 @@ def build_decision_assistant(analysis):
         )
 
     elif decision == "VENTE POTENTIELLE":
-        if price_vs_200 != "En dessous":
-            verdict = "BIAIS BAISSIER — ATTENDRE"
-            confirmation = (
-                "Le prix n'est pas sous l'EMA 200 H4. "
-                "Attendre une faiblesse confirmée sous cette moyenne."
-            )
-        elif setup == "VENTE À VALIDER":
+        if setup == "VENTE À VALIDER":
             verdict = "CONFIGURATION DE VENTE — VALIDATION MANUELLE"
             confirmation = (
-                "Un FVG baissier actif a été retesté et la dernière bougie M30 "
-                "montre un rejet baissier. Vérifier le contexte, le stop-loss "
-                "et le ratio risque/rendement avant toute décision."
+                "La zone d'offre a été rejetée à la baisse et la structure M30 "
+                "confirme le mouvement. L'EMA 200 H4 sert de contexte, pas de veto. "
+                "Vérifier l'accessibilité de l'entrée, le stop et le R/R."
             )
         elif setup.startswith("ZONE BAISSIÈRE"):
             verdict = "ZONE DE VENTE ATTEINTE — ATTENDRE"
@@ -1311,6 +1120,8 @@ def build_decision_assistant(analysis):
             f"H4 : {h4} | H1 : {h1} | M30 : {m30}. FVG : {fvg}."
         ),
         "setup": setup,
+        "scenario_buy": scenario_buy,
+        "scenario_sell": scenario_sell,
         "rejection": rejection,
         "zones": zones,
         "entry": analysis.get("Plan_entree"),
@@ -1340,14 +1151,10 @@ def trigger_confirmed_entry_alert(pair, label, analysis):
         direction = "ACHAT"
         voice = VOICE_STRONG_BULL
         emoji = "🟢"
-        if analysis.get("Prix_vs_EMA200") != "Au-dessus":
-            return
     elif setup == "VENTE À VALIDER":
         direction = "VENTE"
         voice = VOICE_STRONG_BEAR
         emoji = "🔴"
-        if analysis.get("Prix_vs_EMA200") != "En dessous":
-            return
     else:
         return
 
@@ -1375,18 +1182,18 @@ def trigger_confirmed_entry_alert(pair, label, analysis):
         f"{emoji} CONFIGURATION À SURVEILLER {direction} — {label}",
         f"Instrument : {pair}",
         f"Prix actuel : {analysis.get('Prix', 'N/D')}",
-        f"Entrée théorique (milieu FVG) : {entry}",
+        f"Entrée indicative (milieu zone offre/demande) : {entry}",
         f"Stop Loss indicatif : {stop}",
         f"Take Profit indicatif : {target}",
         f"Ratio risque/rendement : 1:{rr_value:.2f}",
-        f"Zone FVG : {analysis.get('Plan_fvg_zone', 'N/D')}",
-        f"Confirmation : rejet M30 détecté",
+        f"Zone offre/demande : {analysis.get('Plan_fvg_zone', 'N/D')}",
+        f"Confirmation : rejet M30 + structure récente",
         f"Bougie M30 : {candle_time}",
         "",
         "Signal informatif seulement : vérifier le graphique et les niveaux "
         "avant toute décision. Aucun ordre n'a été envoyé."
     ]
-    email_body = "\\n".join(message_lines)
+    email_body = "\n".join(message_lines)
 
     st.session_state["last_entry_alert_message"] = (
         f"{emoji} **Configuration {direction} à surveiller — {label}** "
@@ -1597,7 +1404,7 @@ if instruments_config:
             use_container_width=True,
             hide_index=True
         )
-        st.caption("Une alerte exige une structure récente, un retest et un rejet dans le FVG retenu.")
+        st.caption("Les alertes exigent un rejet M30 confirmé sur une zone d’offre/demande, une structure récente, une entrée encore accessible et un R/R suffisant.")
 
 
 
@@ -1737,6 +1544,9 @@ for config in instruments_config:
             st.subheader("Assistant de décision")
             st.markdown(f"**{assistant['verdict']}**")
             st.write(assistant["lecture"])
+            st.markdown("#### Scénarios surveillés")
+            st.write(f"🟢 **Achat :** {assistant.get('scenario_buy', 'N/D')}")
+            st.write(f"🔴 **Vente :** {assistant.get('scenario_sell', 'N/D')}")
             st.markdown("#### Plan indicatif — niveaux M30")
             if assistant["entry"] is not None:
                 p1, p2, p3, p4 = st.columns(4)
@@ -1748,7 +1558,7 @@ for config in instruments_config:
                     f"1:{assistant['rr']:.2f}" if assistant["rr"] is not None else "N/D"
                 )
                 st.caption(
-                    f"Zone FVG utilisée : {assistant['plan_fvg_zone']} | "
+                    f"Zone offre/demande : {assistant['plan_fvg_zone']} | "
                     f"Cible : {assistant['target_method']} | "
                     f"{assistant['plan_status']}"
                 )
@@ -1759,14 +1569,16 @@ for config in instruments_config:
                 st.write(f"**H4 :** {assistant_analysis['H4']} | **H1 :** {assistant_analysis['H1']} | **M30 :** {assistant_analysis['M30']}")
                 st.write(f"**Setup :** {assistant['setup']}")
                 st.write(f"**Rejet M30 :** {assistant['rejection']}")
-                st.write(f"**FVG retenu :** {assistant['plan_fvg_zone']}")
+                st.write(f"**Zone de demande :** {assistant_analysis.get('Demand_zone')}")
+                st.write(f"**Zone d’offre :** {assistant_analysis.get('Supply_zone')}")
+                st.write(f"**Zone retenue :** {assistant['plan_fvg_zone']}")
                 st.write(f"**Cible :** {assistant['target_method']}")
                 st.write(f"**Zones FVG actives :** {assistant['zones']}")
                 st.write(f"**Confirmation :** {assistant['confirmation']}")
                 st.write(f"**Invalidation :** {assistant['invalidation']}")
                 for reason in assistant_analysis.get("Raisons_blocage_alerte", []):
                     st.write(f"• {reason}")
-            st.caption("Aucun ordre n'est envoyé automatiquement. Les niveaux restent indicatifs.")
+            st.caption("Aucun ordre n'est envoyé automatiquement. Les niveaux restent indicatifs et doivent être validés sur le graphique.")
 
         # ---------------------------------------------
         # HISTORIQUE FVG
@@ -1942,3 +1754,4 @@ st.caption(
     f"Dernière mise à jour : "
     f"{now.strftime('%Y-%m-%d %H:%M:%S')} NY"
 )
+
