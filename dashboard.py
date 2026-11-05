@@ -19,7 +19,7 @@ from streamlit_autorefresh import st_autorefresh
 # =========================================================
 
 st.set_page_config(
-    page_title="Trading Monitor V3 - Confluence",
+    page_title="Trading Monitor - Décision",
     layout="wide"
 )
 
@@ -85,7 +85,7 @@ CANDLE_COUNT = 300
 # SIDEBAR : SÉLECTION DES INSTRUMENTS
 # =========================================================
 
-st.sidebar.title("Trading Monitor V2")
+st.sidebar.title("Trading Monitor")
 
 st.sidebar.subheader("Configuration des instruments")
 
@@ -160,7 +160,7 @@ email_recipient = st.sidebar.text_input(
 
 show_ema = st.sidebar.checkbox(
     "Afficher EMA 50 / 100 / 200",
-    value=True
+    value=False
 )
 
 show_fvg = st.sidebar.checkbox(
@@ -170,7 +170,7 @@ show_fvg = st.sidebar.checkbox(
 
 show_structure = st.sidebar.checkbox(
     "Afficher BOS / CHoCH",
-    value=True
+    value=False
 )
 
 
@@ -509,8 +509,9 @@ def detect_fvg(df):
                 "time": df["time"].iloc[i - 2],
                 "end": df["time"].iloc[i],
                 "type": "Bullish FVG",
-                "top": df["low"].iloc[i],
-                "bottom": df["high"].iloc[i - 2]
+                "top": float(df["low"].iloc[i]),
+                "bottom": float(df["high"].iloc[i - 2]),
+                "index": i
             })
 
         # FVG baissier
@@ -520,8 +521,9 @@ def detect_fvg(df):
                 "time": df["time"].iloc[i - 2],
                 "end": df["time"].iloc[i],
                 "type": "Bearish FVG",
-                "top": df["low"].iloc[i - 2],
-                "bottom": df["high"].iloc[i]
+                "top": float(df["low"].iloc[i - 2]),
+                "bottom": float(df["high"].iloc[i]),
+                "index": i
             })
 
     return gaps
@@ -628,7 +630,7 @@ def get_active_fvgs(df):
     return active_gaps
 
 
-def calculate_trade_levels(df_m30, active_gaps, direction, current_price):
+def calculate_trade_levels(df_m30, active_gaps, direction, current_price, selected_gap=None):
     """
     Calcule des niveaux indicatifs à partir du FVG actif le plus récent,
     des derniers pivots M30 et d'un coussin basé sur l'ATR.
@@ -658,14 +660,14 @@ def calculate_trade_levels(df_m30, active_gaps, direction, current_price):
         result["status"] = "Aucun FVG actif dans le sens du scénario"
         return result
 
-    # FVG le plus récent dans le sens de la confluence
-    gap = matching_gaps[-1]
+    # Le plan doit utiliser le FVG exact ayant généré le rejet.
+    gap = selected_gap if selected_gap in matching_gaps else matching_gaps[-1]
     gap_bottom = float(gap["bottom"])
     gap_top = float(gap["top"])
     entry = (gap_bottom + gap_top) / 2.0
 
     # Pivots M30 confirmés (rolling window centré de 5 bougies)
-    recent = df_m30.tail(120).copy()
+    recent = df_m30.tail(120).iloc[:-2].copy()
     highs = recent["high"].astype(float)
     lows = recent["low"].astype(float)
 
@@ -1001,11 +1003,92 @@ def get_confluence_analysis(pair):
         elif result["decision"] == "VENTE POTENTIELLE":
             trade_direction = "SHORT"
 
+        # Revalidation stricte : le rejet doit provenir du FVG précis
+        # le plus récent dans le sens du scénario, et non de n'importe quel FVG.
+        selected_gap = None
+        exact_rejection = None
+        if trade_direction:
+            wanted_type = "Bullish FVG" if trade_direction == "LONG" else "Bearish FVG"
+            fresh_matching = [
+                gap for gap in active_gaps
+                if gap.get("type") == wanted_type
+                and len(df_m30) - 1 - gap.get("index", -9999) <= 40
+            ]
+            if fresh_matching:
+                candidate_gap = fresh_matching[-1]
+                candle_touched = (
+                    float(last_m30["low"]) <= float(candidate_gap["top"])
+                    and float(last_m30["high"]) >= float(candidate_gap["bottom"])
+                )
+                if trade_direction == "LONG":
+                    valid_rejection = (
+                        candle_touched
+                        and float(last_m30["close"]) > float(last_m30["open"])
+                        and float(last_m30["close"]) > float(candidate_gap["top"])
+                    )
+                    if valid_rejection:
+                        exact_rejection = "Haussier"
+                else:
+                    valid_rejection = (
+                        candle_touched
+                        and float(last_m30["close"]) < float(last_m30["open"])
+                        and float(last_m30["close"]) < float(candidate_gap["bottom"])
+                    )
+                    if valid_rejection:
+                        exact_rejection = "Baissier"
+
+                if valid_rejection:
+                    selected_gap = candidate_gap
+
+            # Une réaction récente et opposée dans un FVG neutralise le setup.
+            opposite_type = "Bearish FVG" if trade_direction == "LONG" else "Bullish FVG"
+            opposite_gaps = [
+                gap for gap in active_gaps
+                if gap.get("type") == opposite_type
+                and len(df_m30) - 1 - gap.get("index", -9999) <= 8
+            ]
+            for opposite_gap in opposite_gaps:
+                touched = (
+                    float(last_m30["low"]) <= float(opposite_gap["top"])
+                    and float(last_m30["high"]) >= float(opposite_gap["bottom"])
+                )
+                opposite_rejection = (
+                    touched
+                    and (
+                        (float(last_m30["close"]) < float(last_m30["open"])
+                         and float(last_m30["close"]) < float(opposite_gap["bottom"]))
+                        if trade_direction == "LONG"
+                        else
+                        (float(last_m30["close"]) > float(last_m30["open"])
+                         and float(last_m30["close"]) > float(opposite_gap["top"]))
+                    )
+                )
+                if opposite_rejection:
+                    selected_gap = None
+                    exact_rejection = None
+                    result["Raisons_blocage_alerte"].append(
+                        "Réaction opposée récente dans un FVG"
+                    )
+                    break
+
+        result["Rejet_M30"] = exact_rejection or "Aucun"
+        if trade_direction == "LONG":
+            result["Setup_M30"] = (
+                "ACHAT À VALIDER" if exact_rejection
+                else "ATTENDRE — retest/rejet du FVG haussier précis"
+            )
+        elif trade_direction == "SHORT":
+            result["Setup_M30"] = (
+                "VENTE À VALIDER" if exact_rejection
+                else "ATTENDRE — retest/rejet du FVG baissier précis"
+            )
+
         trade_plan = calculate_trade_levels(
             df_m30,
             active_gaps,
-            trade_direction,
-            current_price
+            trade_direction if selected_gap else None,
+            current_price,
+            selected_gap=selected_gap
         )
 
         result["Plan_direction"] = trade_plan["direction"] or "N/D"
@@ -1033,7 +1116,7 @@ def get_confluence_analysis(pair):
                 latest_h1_event is None
                 or latest_h1_event.get("direction") != expected_structure
                 or latest_h1_event.get("type") not in ("BOS", "CHoCH")
-                or (len(df_h1) - 1 - latest_h1_event.get("index", -999)) > 30
+                or (len(df_h1) - 1 - latest_h1_event.get("index", -999)) > 12
             ):
                 block_reasons.append("Structure H1 absente, opposée ou trop ancienne")
 
@@ -1042,7 +1125,7 @@ def get_confluence_analysis(pair):
                 latest_m30_event is None
                 or latest_m30_event.get("direction") != expected_structure
                 or latest_m30_event.get("type") not in ("BOS", "CHoCH")
-                or (len(df_m30) - 1 - latest_m30_event.get("index", -999)) > 20
+                or (len(df_m30) - 1 - latest_m30_event.get("index", -999)) > 8
             ):
                 block_reasons.append("Structure M30 absente, opposée ou trop ancienne")
 
@@ -1289,7 +1372,7 @@ def trigger_confirmed_entry_alert(pair, label, analysis):
     st.session_state[alert_key] = True
 
     message_lines = [
-        f"{emoji} SIGNAL D'ENTRÉE {direction} — {label}",
+        f"{emoji} CONFIGURATION À SURVEILLER {direction} — {label}",
         f"Instrument : {pair}",
         f"Prix actuel : {analysis.get('Prix', 'N/D')}",
         f"Entrée théorique (milieu FVG) : {entry}",
@@ -1306,7 +1389,7 @@ def trigger_confirmed_entry_alert(pair, label, analysis):
     email_body = "\\n".join(message_lines)
 
     st.session_state["last_entry_alert_message"] = (
-        f"{emoji} **Entrée {direction} détectée — {label}** "
+        f"{emoji} **Configuration {direction} à surveiller — {label}** "
         f"| R/R : 1:{rr_value:.2f}"
     )
 
@@ -1321,7 +1404,7 @@ def trigger_confirmed_entry_alert(pair, label, analysis):
         else:
             try:
                 send_entry_email(
-                    f"Signal {direction} confirmé — {label}",
+                    f"Configuration {direction} à surveiller — {label}",
                     email_body,
                     email_recipient.strip()
                 )
@@ -1443,7 +1526,7 @@ def create_chart(
             )
 
     fig.update_layout(
-        height=750,
+        height=520,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
         title=f"Smart Money Concepts - {timeframe}",
@@ -1470,7 +1553,7 @@ def create_chart(
 # PAGE PRINCIPALE
 # =========================================================
 
-st.title("Trading Monitor V2")
+st.title("Trading Monitor")
 
 st.caption(
     "Smart Money Lite | OANDA | "
@@ -1490,65 +1573,32 @@ if st.session_state.get("last_entry_email_status"):
 # =========================================================
 
 if instruments_config:
-    st.subheader("Confluence multi-timeframe — H4 / H1 / M30")
-
-    confluence_rows = []
+    st.subheader("Vue d'ensemble")
+    summary_rows = []
     seen_pairs = set()
-
     for config in instruments_config:
         pair = config["pair"]
-
-        # Évite d'analyser deux fois le même instrument si sélectionné
-        # dans plusieurs emplacements.
         if pair in seen_pairs:
             continue
-
         seen_pairs.add(pair)
-        analysis = get_confluence_analysis(pair)
-
-        confluence_rows.append({
-            "Instrument": config["label"],
-            "Prix": analysis["Prix"],
-            "EMA 50 (H4)": analysis["EMA50"],
-            "EMA 100 (H4)": analysis["EMA100"],
-            "EMA 200 (H4)": analysis["EMA200"],
-            "Prix / EMA 50": analysis["Prix_vs_EMA50"],
-            "Prix / EMA 100": analysis["Prix_vs_EMA100"],
-            "Prix / EMA 200": analysis["Prix_vs_EMA200"],
-            "H4": analysis["H4"],
-            "H1": analysis["H1"],
-            "M30": analysis["M30"],
-            "FVG M30": analysis["FVG"],
-            "FVG actifs M30": analysis["FVG_actifs"],
-            "Prix dans FVG": analysis["Prix_dans_FVG"],
-            "Zones FVG actives": analysis["Zones_FVG_actives"],
-            "Assistant": build_decision_assistant(analysis)["verdict"],
-            "Validation M30": analysis["Setup_M30"],
-            "Rejet M30": analysis["Rejet_M30"],
-            "Entrée théorique": analysis["Plan_entree"],
-            "Stop Loss": analysis["Plan_stop"],
-            "Take Profit": analysis["Plan_tp"],
-            "Ratio R/R": analysis["Plan_rr"],
-            "Plan": analysis["Plan_status"],
-            "Score haussier": analysis["bullish_score"],
-            "Score baissier": analysis["bearish_score"],
-            "Décision": analysis["decision"],
-            "Détails": analysis["details"]
+        a = get_confluence_analysis(pair)
+        summary_rows.append({
+            "Marché": config["label"],
+            "Biais": a["decision"],
+            "H4": a["H4"],
+            "H1": a["H1"],
+            "M30": a["M30"],
+            "Configuration": a["Setup_M30"],
+            "R/R": f'1:{a["Plan_rr"]:.2f}' if a["Plan_rr"] is not None else "—"
         })
-
-    if confluence_rows:
-        confluence_df = pd.DataFrame(confluence_rows)
+    if summary_rows:
         st.dataframe(
-            confluence_df,
+            pd.DataFrame(summary_rows),
             use_container_width=True,
             hide_index=True
         )
+        st.caption("Une alerte exige une structure récente, un retest et un rejet dans le FVG retenu.")
 
-        st.caption(
-            "Les EMA affichées sont calculées sur H4. Le prix est la "
-            "dernière clôture M1 disponible via OANDA. Le score repose "
-            "sur H4, H1, M30 et les FVG M30."
-        )
 
 
 if not instruments_config:
@@ -1661,42 +1711,12 @@ for config in instruments_config:
             structure_status = "Aucun événement"
 
         # ---------------------------------------------
-        # INDICATEURS À L'ÉCRAN
-        # ---------------------------------------------
+        # Résumé visuel compact
+        st.caption(
+            f"Prix : {current_price:.5f} | EMA : {ema_status} | "
+            f"Structure M30 : {structure_status} | FVG actifs : {len(gaps)}"
+        )
 
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-
-            st.metric(
-                "Prix actuel",
-                f"{current_price:.5f}"
-                if current_price is not None
-                else "N/D"
-            )
-
-        with col2:
-
-            st.metric(
-                "Tendance EMA",
-                ema_status
-            )
-
-        with col3:
-
-            st.metric(
-                "Structure",
-                structure_status
-            )
-
-        with col4:
-
-            st.metric(
-                "FVG actifs",
-                len(gaps)
-            )
-
-        # ---------------------------------------------
         # ASSISTANT DE DÉCISION
         # ---------------------------------------------
 
@@ -1717,10 +1737,7 @@ for config in instruments_config:
             st.subheader("Assistant de décision")
             st.markdown(f"**{assistant['verdict']}**")
             st.write(assistant["lecture"])
-            st.markdown(f"**État du setup :** {assistant['setup']}")
-            st.markdown(f"**Rejet M30 détecté :** {assistant['rejection']}")
-
-            st.markdown("#### Plan de trade indicatif — niveaux M30")
+            st.markdown("#### Plan indicatif — niveaux M30")
             if assistant["entry"] is not None:
                 p1, p2, p3, p4 = st.columns(4)
                 p1.metric("Entrée théorique", f"{assistant['entry']:.5f}")
@@ -1738,61 +1755,18 @@ for config in instruments_config:
             else:
                 st.info(assistant["plan_status"])
 
-            st.markdown(f"**Confirmation à attendre :** {assistant['confirmation']}")
-            st.markdown(f"**Invalidation / prudence :** {assistant['invalidation']}")
-            st.caption(f"Zones FVG M30 actives : {assistant['zones']}")
-            st.caption(
-                "Assistant informatif : aucune entrée, aucun stop-loss et aucun ordre "
-                "ne sont générés automatiquement. Valide toujours le graphique."
-            )
-
-        # ---------------------------------------------
-        # ALERTE STRUCTURELLE
-        # ---------------------------------------------
-
-        if last_event and last_event["time"] == last["time"]:
-
-            if last_event["direction"] == 1:
-
-                signal = (
-                    "🟢 CHoCH haussier"
-                    if last_event["type"] == "CHoCH"
-                    else "🟢 BOS haussier"
-                )
-
-                voice = VOICE_STRONG_BULL
-
-            else:
-
-                signal = (
-                    "🔴 CHoCH baissier"
-                    if last_event["type"] == "CHoCH"
-                    else "🔴 BOS baissier"
-                )
-
-                voice = VOICE_STRONG_BEAR
-
-            st.subheader(signal)
-
-            alert_key = (
-                f"{pair}_{timeframe}_"
-                f"{last_event['time']}_{last_event['type']}"
-            )
-
-            if not mute_alerts:
-
-                if alert_key not in st.session_state:
-
-                    play_voice_alert(voice)
-
-                    st.session_state[alert_key] = True
-
-        else:
-
-            st.info(
-                "Aucune nouvelle cassure structurelle "
-                "sur le dernier chandelier terminé."
-            )
+            with st.expander("Détails et raisons d'attendre"):
+                st.write(f"**H4 :** {assistant_analysis['H4']} | **H1 :** {assistant_analysis['H1']} | **M30 :** {assistant_analysis['M30']}")
+                st.write(f"**Setup :** {assistant['setup']}")
+                st.write(f"**Rejet M30 :** {assistant['rejection']}")
+                st.write(f"**FVG retenu :** {assistant['plan_fvg_zone']}")
+                st.write(f"**Cible :** {assistant['target_method']}")
+                st.write(f"**Zones FVG actives :** {assistant['zones']}")
+                st.write(f"**Confirmation :** {assistant['confirmation']}")
+                st.write(f"**Invalidation :** {assistant['invalidation']}")
+                for reason in assistant_analysis.get("Raisons_blocage_alerte", []):
+                    st.write(f"• {reason}")
+            st.caption("Aucun ordre n'est envoyé automatiquement. Les niveaux restent indicatifs.")
 
         # ---------------------------------------------
         # HISTORIQUE FVG
@@ -1968,4 +1942,3 @@ st.caption(
     f"Dernière mise à jour : "
     f"{now.strftime('%Y-%m-%d %H:%M:%S')} NY"
 )
-
