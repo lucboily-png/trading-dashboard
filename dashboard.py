@@ -859,21 +859,27 @@ def calculate_zone_trade_plan(df, zone, direction, current_price):
         risk, reward = stop-entry, entry-target
         distance = (entry-float(current_price))/atr
     rr_value = reward/risk if risk > 0 else None
+    # Un plan est expiré dès que sa cible a déjà été atteinte/dépassée.
+    # On vérifie ensuite l'invalidation de la zone, puis l'éloignement de l'entrée.
     if direction == "LONG":
-        if current_price > entry + 0.65*atr:
-            status = "OCCASION DÉPASSÉE — attendre un nouveau retest"
+        if float(current_price) >= target:
+            status = "OBJECTIF DÉJÀ ATTEINT — PLAN EXPIRÉ"
         elif current_price < bottom - buffer:
             status = "ZONE INVALIDÉE"
+        elif current_price > entry + 0.65 * atr:
+            status = "OCCASION DÉPASSÉE — attendre un nouveau retest"
         else:
             status = "ENTRÉE ACCESSIBLE À VALIDER" if abs(distance) <= 0.65 else "ATTENDRE LE RETOUR DANS LA ZONE"
     else:
-        if current_price < entry - 0.65*atr:
-            status = "OCCASION DÉPASSÉE — attendre un nouveau retest"
+        if float(current_price) <= target:
+            status = "OBJECTIF DÉJÀ ATTEINT — PLAN EXPIRÉ"
         elif current_price > top + buffer:
             status = "ZONE INVALIDÉE"
+        elif current_price < entry - 0.65 * atr:
+            status = "OCCASION DÉPASSÉE — attendre un nouveau retest"
         else:
             status = "ENTRÉE ACCESSIBLE À VALIDER" if abs(distance) <= 0.65 else "ATTENDRE LE RETOUR DANS LA ZONE"
-    if rr_value is not None and rr_value < 1.5:
+    if rr_value is not None and rr_value < 1.5 and status == "ENTRÉE ACCESSIBLE À VALIDER":
         status = "R/R INSUFFISANT"
     out.update({"entry": entry, "stop": stop, "target": target, "rr": rr_value,
                 "status": status, "distance_atr": abs(distance),
@@ -1032,11 +1038,28 @@ def get_confluence_analysis(pair):
                 atr_now = calculate_atr(df_m30)
                 dist = abs(float(current_price) - float(old_plan["entry"])) / atr_now if atr_now else 999
                 if direction == "LONG":
-                    status = "OCCASION DÉPASSÉE — attendre un nouveau retest" if current_price > old_plan["entry"] + 0.65*atr_now else "ENTRÉE ACCESSIBLE À VALIDER"
+                    if float(current_price) >= float(old_plan["take_profit"]):
+                        status = "OBJECTIF DÉJÀ ATTEINT — PLAN EXPIRÉ"
+                    elif float(current_price) <= float(old_plan["stop_loss"]):
+                        status = "STOP THÉORIQUE TOUCHÉ — PLAN INVALIDÉ"
+                    elif current_price > old_plan["entry"] + 0.65 * atr_now:
+                        status = "OCCASION DÉPASSÉE — attendre un nouveau retest"
+                    else:
+                        status = "ENTRÉE ACCESSIBLE À VALIDER"
                 else:
-                    status = "OCCASION DÉPASSÉE — attendre un nouveau retest" if current_price < old_plan["entry"] - 0.65*atr_now else "ENTRÉE ACCESSIBLE À VALIDER"
+                    if float(current_price) <= float(old_plan["take_profit"]):
+                        status = "OBJECTIF DÉJÀ ATTEINT — PLAN EXPIRÉ"
+                    elif float(current_price) >= float(old_plan["stop_loss"]):
+                        status = "STOP THÉORIQUE TOUCHÉ — PLAN INVALIDÉ"
+                    elif current_price < old_plan["entry"] - 0.65 * atr_now:
+                        status = "OCCASION DÉPASSÉE — attendre un nouveau retest"
+                    else:
+                        status = "ENTRÉE ACCESSIBLE À VALIDER"
+                if old_plan["rr"] is None or old_plan["rr"] < 1.5:
+                    if status == "ENTRÉE ACCESSIBLE À VALIDER":
+                        status = "R/R INSUFFISANT"
                 plan = {"entry": old_plan["entry"], "stop": old_plan["stop_loss"], "target": old_plan["take_profit"],
-                        "rr": old_plan["rr"], "status": status if old_plan["rr"] and old_plan["rr"] >= 1.5 else "R/R INSUFFISANT",
+                        "rr": old_plan["rr"], "status": status,
                         "distance_atr": dist, "zone_text": old_plan["fvg_zone"], "target_method": old_plan["target_method"]}
         if plan:
             result.update({"Plan_direction": direction, "Plan_entree": plan.get("entry"), "Plan_stop": plan.get("stop"),
@@ -1064,6 +1087,10 @@ def get_confluence_analysis(pair):
                 blocks.append("Niveaux de risque non calculables")
             if plan.get("status", "").startswith("OCCASION DÉPASSÉE"):
                 blocks.append("Le prix a déjà quitté la zone d'entrée : ne pas poursuivre le mouvement")
+            if plan.get("status") == "OBJECTIF DÉJÀ ATTEINT — PLAN EXPIRÉ":
+                blocks.append("La cible théorique a déjà été atteinte : plan expiré, aucune entrée à poursuivre")
+            if plan.get("status") == "STOP THÉORIQUE TOUCHÉ — PLAN INVALIDÉ":
+                blocks.append("Le stop théorique a été touché : plan invalidé")
             if plan.get("status") == "ZONE INVALIDÉE":
                 blocks.append("La zone de déclenchement est invalidée")
             if plan.get("rr") is None or plan.get("rr", 0) < 1.5:
@@ -1193,6 +1220,8 @@ def build_decision_assistant(analysis):
         "scenario_sell": scenario_sell,
         "rejection": rejection,
         "zones": zones,
+        "current_price": analysis.get("Prix"),
+        "distance_entry_atr": analysis.get("Distance_entree_atr"),
         "entry": analysis.get("Plan_entree"),
         "stop": analysis.get("Plan_stop"),
         "target": analysis.get("Plan_tp"),
@@ -1619,6 +1648,12 @@ for config in instruments_config:
             st.write(f"🟢 **Achat :** {assistant.get('scenario_buy', 'N/D')}")
             st.write(f"🔴 **Vente :** {assistant.get('scenario_sell', 'N/D')}")
             st.markdown("#### Plan indicatif — niveaux M30")
+            if assistant["current_price"] is not None:
+                st.write(f"**Prix actuel :** {float(assistant['current_price']):.5f}")
+            if assistant["plan_status"] != "ENTRÉE ACCESSIBLE À VALIDER":
+                st.warning(f"**STATUT DU PLAN : {assistant['plan_status']}**")
+            else:
+                st.success(f"**STATUT DU PLAN : {assistant['plan_status']}**")
             if assistant["entry"] is not None:
                 p1, p2, p3, p4 = st.columns(4)
                 p1.metric("Entrée théorique", f"{assistant['entry']:.5f}")
@@ -1628,10 +1663,11 @@ for config in instruments_config:
                     "Ratio R/R",
                     f"1:{assistant['rr']:.2f}" if assistant["rr"] is not None else "N/D"
                 )
+                distance_atr = assistant.get("distance_entry_atr")
+                distance_text = f" | Distance entrée : {distance_atr:.2f} ATR" if distance_atr is not None else ""
                 st.caption(
                     f"Zone offre/demande : {assistant['plan_fvg_zone']} | "
-                    f"Cible : {assistant['target_method']} | "
-                    f"{assistant['plan_status']}"
+                    f"Cible : {assistant['target_method']}{distance_text}"
                 )
             else:
                 st.info(assistant["plan_status"])
