@@ -892,6 +892,7 @@ def get_confluence_analysis(pair):
         "Plan_entree": None, "Plan_stop": None, "Plan_tp": None, "Plan_rr": None,
         "Plan_target_method": "N/D", "Plan_fvg_zone": "Aucune", "Plan_status": "Niveaux indisponibles",
         "Alerte_autorisee": False, "Raisons_blocage_alerte": [], "Distance_entree_atr": None,
+        "Confirmation_M5": False, "Structure_M5": "N/D", "M5_candle_time": "N/D",
         "Support_resistance_proche": None, "score": 0, "bullish_score": 0,
         "bearish_score": 0, "decision": "ATTENTE", "details": "",
         "Demand_zone": None, "Supply_zone": None, "Scenario_achat": "Aucun setup",
@@ -901,12 +902,19 @@ def get_confluence_analysis(pair):
         df_h4 = get_data(pair, "H4", CANDLE_COUNT)
         df_h1 = get_data(pair, "H1", CANDLE_COUNT)
         df_m30 = get_data(pair, "M30", CANDLE_COUNT)
+        df_m5 = get_data(pair, "M5", CANDLE_COUNT)
+
         if min(len(df_h4), len(df_h1), len(df_m30)) < 210:
-            result["details"] = "Données insuffisantes"
+            result["details"] = "Données insuffisantes en H4, H1 ou M30"
             return result
+        if len(df_m5) < 30:
+            result["details"] = "Données M5 insuffisantes pour confirmer l'entrée"
+            return result
+
         df_h4, df_h1, df_m30 = map(calculate_indicators, (df_h4, df_h1, df_m30))
         df_h1, events_h1 = detect_market_structure(df_h1)
         df_m30, events_m30 = detect_market_structure(df_m30)
+        df_m5, events_m5 = detect_market_structure(df_m5)
         current_price = get_current_price(pair)
         if current_price is None:
             current_price = float(df_m30["close"].iloc[-1])
@@ -918,7 +926,31 @@ def get_confluence_analysis(pair):
         h4 = get_ema_direction(df_h4)
         h1 = get_structure_bias(events_h1, len(df_h1), max_age=12)
         m30 = get_structure_bias(events_m30, len(df_m30), max_age=8)
-        result.update({"H4": h4, "H1": h1, "M30": m30})
+
+        # M5 sert uniquement de déclencheur d'entrée, jamais de biais principal.
+        last_m5 = df_m5.iloc[-1]
+        last_m30_time = df_m30["time"].iloc[-1]
+        recent_m5_event = next(
+            (
+                event for event in reversed(events_m5)
+                if len(df_m5) - 1 - event["index"] <= 8
+                and event["time"] >= last_m30_time
+            ),
+            None
+        )
+        m5_structure = "Neutre"
+        if recent_m5_event:
+            m5_structure = (
+                f'{recent_m5_event["type"]} haussier'
+                if recent_m5_event["direction"] == 1
+                else f'{recent_m5_event["type"]} baissier'
+            )
+
+        result.update({
+            "H4": h4, "H1": h1, "M30": m30,
+            "Structure_M5": m5_structure,
+            "M5_candle_time": str(last_m5["time"])
+        })
 
         gaps = get_active_fvgs(df_m30)
         bull_gaps = [g for g in gaps if g["type"] == "Bullish FVG"]
@@ -961,6 +993,18 @@ def get_confluence_analysis(pair):
         block_long_at_supply = supply_near and not supply_broken
         buy_confirmed = (bull_zone_rejection or bull_fvg_rejection) and recent_bull_structure and not block_long_at_supply
         sell_confirmed = (bear_zone_rejection or bear_fvg_rejection) and recent_bear_structure and not block_short_at_demand
+
+        # Validation M5 : un BOS/CHoCH récent doit confirmer le sens du setup M30.
+        # L'événement doit appartenir à la période de la dernière bougie M30 clôturée.
+        m5_buy_confirmed = bool(
+            buy_confirmed and recent_m5_event
+            and recent_m5_event["direction"] == 1
+        )
+        m5_sell_confirmed = bool(
+            sell_confirmed and recent_m5_event
+            and recent_m5_event["direction"] == -1
+        )
+        result["Confirmation_M5"] = bool(m5_buy_confirmed or m5_sell_confirmed)
 
         # Confluence est informative; elle ne remplace plus le déclencheur de prix.
         bull_score = sum([h4 == "Haussière", h1 == "Haussière", m30 == "Haussière", fvg == "Haussier"])
@@ -1012,6 +1056,10 @@ def get_confluence_analysis(pair):
             if not recent_bull_structure and not recent_bear_structure:
                 blocks.append("Aucun BOS/CHoCH M30 récent dans le sens du rejet")
         else:
+            if direction == "LONG" and not m5_buy_confirmed:
+                blocks.append("Attendre un BOS/CHoCH haussier M5 récent après la clôture M30")
+            if direction == "SHORT" and not m5_sell_confirmed:
+                blocks.append("Attendre un BOS/CHoCH baissier M5 récent après la clôture M30")
             if plan.get("entry") is None:
                 blocks.append("Niveaux de risque non calculables")
             if plan.get("status", "").startswith("OCCASION DÉPASSÉE"):
@@ -1023,7 +1071,14 @@ def get_confluence_analysis(pair):
             if plan.get("target_method", "").startswith("Projection"):
                 blocks.append("Cible structurelle absente : projection 2R seulement, pas d'alerte automatique")
         result["Raisons_blocage_alerte"] = blocks
-        result["Alerte_autorisee"] = bool(direction and not blocks and plan.get("status") == "ENTRÉE ACCESSIBLE À VALIDER")
+        result["Alerte_autorisee"] = bool(
+            direction and not blocks
+            and plan.get("status") == "ENTRÉE ACCESSIBLE À VALIDER"
+            and (
+                (direction == "LONG" and m5_buy_confirmed)
+                or (direction == "SHORT" and m5_sell_confirmed)
+            )
+        )
         result["M30_candle_time"] = str(last["time"])
         result["Prix_dans_FVG"] = "Oui" if any(g["bottom"] <= current_price <= g["top"] for g in gaps) else "Non"
         result["Support_resistance_proche"] = demand if demand_near else supply if supply_near else None
@@ -1052,14 +1107,22 @@ def build_decision_assistant(analysis):
     bear = analysis.get("bearish_score", 0)
     zones = analysis.get("Zones_FVG_actives", "Aucune")
     rejection = analysis.get("Rejet_M30", "Aucun")
+    m5_confirmed = analysis.get("Confirmation_M5", False)
+    m5_structure = analysis.get("Structure_M5", "N/D")
 
     if decision == "ACHAT POTENTIEL":
-        if setup == "ACHAT À VALIDER":
+        if setup == "ACHAT À VALIDER" and m5_confirmed:
             verdict = "CONFIGURATION D'ACHAT — VALIDATION MANUELLE"
             confirmation = (
-                "La zone de demande a été rejetée à la hausse et la structure M30 "
-                "confirme le mouvement. L'EMA 200 H4 sert de contexte, pas de veto. "
+                "La zone a été rejetée à la hausse, la structure M30 est favorable "
+                "et un BOS/CHoCH haussier M5 confirme le déclenchement. "
                 "Vérifier l'accessibilité de l'entrée, le stop et le R/R."
+            )
+        elif setup == "ACHAT À VALIDER":
+            verdict = "ACHAT À SURVEILLER — ATTENTE CONFIRMATION M5"
+            confirmation = (
+                "Le rejet et la structure M30 sont présents, mais le M5 n'a pas "
+                "encore confirmé par un BOS/CHoCH haussier clôturé. Ne pas anticiper."
             )
         elif setup.startswith("ZONE HAUSSIÈRE"):
             verdict = "ZONE D'ACHAT ATTEINTE — ATTENDRE"
@@ -1079,12 +1142,18 @@ def build_decision_assistant(analysis):
         )
 
     elif decision == "VENTE POTENTIELLE":
-        if setup == "VENTE À VALIDER":
+        if setup == "VENTE À VALIDER" and m5_confirmed:
             verdict = "CONFIGURATION DE VENTE — VALIDATION MANUELLE"
             confirmation = (
-                "La zone d'offre a été rejetée à la baisse et la structure M30 "
-                "confirme le mouvement. L'EMA 200 H4 sert de contexte, pas de veto. "
+                "La zone a été rejetée à la baisse, la structure M30 est favorable "
+                "et un BOS/CHoCH baissier M5 confirme le déclenchement. "
                 "Vérifier l'accessibilité de l'entrée, le stop et le R/R."
+            )
+        elif setup == "VENTE À VALIDER":
+            verdict = "VENTE À SURVEILLER — ATTENTE CONFIRMATION M5"
+            confirmation = (
+                "Le rejet et la structure M30 sont présents, mais le M5 n'a pas "
+                "encore confirmé par un BOS/CHoCH baissier clôturé. Ne pas anticiper."
             )
         elif setup.startswith("ZONE BAISSIÈRE"):
             verdict = "ZONE DE VENTE ATTEINTE — ATTENDRE"
@@ -1117,7 +1186,7 @@ def build_decision_assistant(analysis):
         "invalidation": invalidation,
         "lecture": (
             f"Confluence : {bull}/4 haussières contre {bear}/4 baissières. "
-            f"H4 : {h4} | H1 : {h1} | M30 : {m30}. FVG : {fvg}."
+            f"H4 : {h4} | H1 : {h1} | M30 : {m30} | M5 : {m5_structure}. FVG : {fvg}."
         ),
         "setup": setup,
         "scenario_buy": scenario_buy,
@@ -1187,7 +1256,8 @@ def trigger_confirmed_entry_alert(pair, label, analysis):
         f"Take Profit indicatif : {target}",
         f"Ratio risque/rendement : 1:{rr_value:.2f}",
         f"Zone offre/demande : {analysis.get('Plan_fvg_zone', 'N/D')}",
-        f"Confirmation : rejet M30 + structure récente",
+        f"Confirmation : rejet M30 + structure M30 + BOS/CHoCH M5",
+        f"Structure M5 : {analysis.get('Structure_M5', 'N/D')}",
         f"Bougie M30 : {candle_time}",
         "",
         "Signal informatif seulement : vérifier le graphique et les niveaux "
@@ -1395,7 +1465,8 @@ if instruments_config:
             "H4": a["H4"],
             "H1": a["H1"],
             "M30": a["M30"],
-            "Configuration": a["Setup_M30"],
+            "Configuration M30": a["Setup_M30"],
+            "Confirmation M5": "Confirmée" if a.get("Confirmation_M5") else "En attente",
             "R/R": f'1:{a["Plan_rr"]:.2f}' if a["Plan_rr"] is not None else "—"
         })
     if summary_rows:
@@ -1569,6 +1640,8 @@ for config in instruments_config:
                 st.write(f"**H4 :** {assistant_analysis['H4']} | **H1 :** {assistant_analysis['H1']} | **M30 :** {assistant_analysis['M30']}")
                 st.write(f"**Setup :** {assistant['setup']}")
                 st.write(f"**Rejet M30 :** {assistant['rejection']}")
+                st.write(f"**Structure M5 :** {assistant_analysis.get('Structure_M5', 'N/D')}")
+                st.write(f"**Confirmation M5 :** {'Oui' if assistant_analysis.get('Confirmation_M5') else 'Non — attendre'}")
                 st.write(f"**Zone de demande :** {assistant_analysis.get('Demand_zone')}")
                 st.write(f"**Zone d’offre :** {assistant_analysis.get('Supply_zone')}")
                 st.write(f"**Zone retenue :** {assistant['plan_fvg_zone']}")
