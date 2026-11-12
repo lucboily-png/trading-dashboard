@@ -74,8 +74,11 @@ def send_email_alert(subject, body):
         message["Subject"] = subject
         message["From"] = email_from
         message["To"] = email_to
-        with smtplib.SMTP(smtp_server, int(smtp_port), timeout=20) as server:
-            server.starttls()
+        import ssl
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(
+            smtp_server, int(smtp_port or 465), context=context, timeout=30
+        ) as server:
             server.login(smtp_username, smtp_password)
             server.send_message(message)
         return True, "Courriel envoyé."
@@ -186,8 +189,8 @@ def add_indicators(df):
     return df
 
 
-def evaluate_ema_scenario(df):
-    """Evaluate the latest closed candle and 3-candle EMA slope."""
+def evaluate_ema_scenario(df, current_price=None):
+    """Évalue la tendance sur chandelles clôturées et distingue un rebond opposé."""
     if len(df) < 205:
         return {
             "state": "NONE", "label": "Données insuffisantes",
@@ -196,9 +199,12 @@ def evaluate_ema_scenario(df):
 
     last = df.iloc[-1]
     lookback = df.iloc[-4]
+    previous = df.iloc[-2]
+    previous2 = df.iloc[-3]
     required = [
         last["close"], last["EMA50"], last["EMA100"], last["EMA200"],
-        lookback["EMA50"], lookback["EMA100"], lookback["EMA200"]
+        lookback["EMA50"], lookback["EMA100"], lookback["EMA200"],
+        previous["close"], previous2["close"]
     ]
     if any(pd.isna(value) for value in required):
         return {
@@ -226,13 +232,37 @@ def evaluate_ema_scenario(df):
             "color": "green",
             "details": "Prix > EMA50 > EMA100 > EMA200; les trois EMA montent."
         }
+
     if bear_order and bear_slope:
+        # Un rebond est détecté si les deux dernières clôtures M30 montent,
+        # ou si le prix courant dépasse la dernière clôture d'au moins 0,10 ATR.
+        recent_closes_rising = (
+            last["close"] > previous["close"]
+            and previous["close"] > previous2["close"]
+        )
+        atr = last.get("ATR14", float("nan"))
+        live_rebound = False
+        if current_price is not None and pd.notna(atr) and atr > 0:
+            live_rebound = current_price > last["close"] + (0.10 * atr)
+
+        if recent_closes_rising or live_rebound:
+            reason = "Les EMA restent alignées à la baisse, mais le prix remonte."
+            if current_price is not None and current_price > last["EMA50"]:
+                reason += " Le prix courant est même repassé au-dessus de l'EMA50."
+            return {
+                "state": "BEAR_REBOUND",
+                "label": "🟠 TENDANCE BAISSIÈRE — REBOND HAUSSIER EN COURS",
+                "color": "orange",
+                "details": reason + " Aucune vente ne doit être déclenchée pendant ce rebond."
+            }
+
         return {
             "state": "BEAR",
             "label": "🔴 SCÉNARIO 2 — TENDANCE BAISSIÈRE CONFIRMÉE",
             "color": "red",
-            "details": "Prix < EMA50 < EMA100 < EMA200; les trois EMA descendent."
+            "details": "Prix < EMA50 < EMA100 < EMA200; les trois EMA descendent et aucun rebond haussier récent n'est détecté."
         }
+
     return {
         "state": "NONE",
         "label": "⚪ Aucun scénario confirmé",
@@ -319,7 +349,7 @@ for config in instruments_config:
 
         df = add_indicators(closed_df)
         current_price = get_current_price(pair)
-        trend = evaluate_ema_scenario(df)
+        trend = evaluate_ema_scenario(df, current_price)
         last = df.iloc[-1]
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
 
