@@ -12,7 +12,7 @@ from streamlit_autorefresh import st_autorefresh
 import smtplib
 from email.mime.text import MIMEText
 
-st.set_page_config(page_title="Trading Monitor - EMA Trend Alerts", layout="wide")
+st.set_page_config(page_title="Trading Monitor - Fibonacci Alerts", layout="wide")
 st_autorefresh(interval=60 * 1000, key="refresh")
 
 
@@ -117,7 +117,8 @@ exposure = capital * leverage
 st.sidebar.write(f"Risque/trade : **{risk_amount:.2f} $**")
 st.sidebar.write(f"Gain potentiel : **{potential_gain:.2f} $**")
 st.sidebar.write(f"Exposition théorique : **{exposure:,.0f} $**")
-st.sidebar.caption("Les signaux EMA sont des alertes de tendance, pas des ordres automatiques.")
+show_emas = st.sidebar.checkbox("Afficher les EMA sur le graphique", value=True)
+st.sidebar.caption("Les alertes reposent sur le dernier Fibonacci valide, pas sur les EMA.")
 
 
 # OANDA DATA
@@ -189,133 +190,181 @@ def add_indicators(df):
     return df
 
 
-def evaluate_ema_scenario(df, current_price=None):
-    """Évalue la tendance sur chandelles clôturées et distingue un rebond opposé."""
-    if len(df) < 205:
-        return {
-            "state": "NONE", "label": "Données insuffisantes",
-            "color": "gray", "details": "Il faut au moins 205 chandelles clôturées."
-        }
+def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
+    """Trouve le dernier swing confirmé et construit son retracement Fibonacci.
 
-    last = df.iloc[-1]
-    lookback = df.iloc[-4]
-    previous = df.iloc[-2]
-    previous2 = df.iloc[-3]
-    required = [
-        last["close"], last["EMA50"], last["EMA100"], last["EMA200"],
-        lookback["EMA50"], lookback["EMA100"], lookback["EMA200"],
-        previous["close"], previous2["close"]
-    ]
-    if any(pd.isna(value) for value in required):
-        return {
-            "state": "NONE", "label": "Calcul des EMA en cours",
-            "color": "gray", "details": "Les indicateurs ne sont pas encore disponibles."
-        }
+    Les pivots sont confirmés seulement après `pivot_window` chandelles à droite,
+    afin d'éviter d'utiliser un sommet/creux qui n'est pas encore établi.
+    """
+    data = df.reset_index(drop=True)
+    if len(data) < max(40, pivot_window * 2 + 20):
+        return None, "Données insuffisantes pour détecter un swing fiable."
 
-    bull_order = last["close"] > last["EMA50"] > last["EMA100"] > last["EMA200"]
-    bull_slope = (
-        last["EMA50"] > lookback["EMA50"]
-        and last["EMA100"] > lookback["EMA100"]
-        and last["EMA200"] > lookback["EMA200"]
-    )
-    bear_order = last["close"] < last["EMA50"] < last["EMA100"] < last["EMA200"]
-    bear_slope = (
-        last["EMA50"] < lookback["EMA50"]
-        and last["EMA100"] < lookback["EMA100"]
-        and last["EMA200"] < lookback["EMA200"]
-    )
+    pivots = []
+    for i in range(pivot_window, len(data) - pivot_window):
+        high = float(data.loc[i, "high"])
+        low = float(data.loc[i, "low"])
+        left = data.iloc[i-pivot_window:i]
+        right = data.iloc[i+1:i+pivot_window+1]
+        is_high = high > float(left["high"].max()) and high >= float(right["high"].max())
+        is_low = low < float(left["low"].min()) and low <= float(right["low"].min())
+        if is_high:
+            pivots.append({"index": i, "type": "HIGH", "price": high, "time": data.loc[i, "time"]})
+        if is_low:
+            pivots.append({"index": i, "type": "LOW", "price": low, "time": data.loc[i, "time"]})
 
-    if bull_order and bull_slope:
-        return {
-            "state": "BULL",
-            "label": "🟢 SCÉNARIO 1 — TENDANCE HAUSSIÈRE CONFIRMÉE",
-            "color": "green",
-            "details": "Prix > EMA50 > EMA100 > EMA200; les trois EMA montent."
-        }
+    pivots.sort(key=lambda x: x["index"])
+    # Fusionne deux pivots consécutifs de même type en conservant l'extrême.
+    alternating = []
+    for pivot in pivots:
+        if not alternating or alternating[-1]["type"] != pivot["type"]:
+            alternating.append(pivot)
+        else:
+            old = alternating[-1]
+            more_extreme = (
+                pivot["price"] > old["price"] if pivot["type"] == "HIGH"
+                else pivot["price"] < old["price"]
+            )
+            if more_extreme:
+                alternating[-1] = pivot
 
-    if bear_order and bear_slope:
-        # Un rebond est détecté si les deux dernières clôtures M30 montent,
-        # ou si le prix courant dépasse la dernière clôture d'au moins 0,10 ATR.
-        recent_closes_rising = (
-            last["close"] > previous["close"]
-            and previous["close"] > previous2["close"]
-        )
-        atr = last.get("ATR14", float("nan"))
-        live_rebound = False
-        if current_price is not None and pd.notna(atr) and atr > 0:
-            live_rebound = current_price > last["close"] + (0.10 * atr)
+    if len(alternating) < 2:
+        return None, "Aucun mouvement haussier ou baissier confirmé détecté."
 
-        if recent_closes_rising or live_rebound:
-            reason = "Les EMA restent alignées à la baisse, mais le prix remonte."
-            if current_price is not None and current_price > last["EMA50"]:
-                reason += " Le prix courant est même repassé au-dessus de l'EMA50."
-            return {
-                "state": "BEAR_REBOUND",
-                "label": "🟠 TENDANCE BAISSIÈRE — REBOND HAUSSIER EN COURS",
-                "color": "orange",
-                "details": reason + " Aucune vente ne doit être déclenchée pendant ce rebond."
-            }
+    # Le dernier mouvement est formé par les deux derniers pivots confirmés.
+    origin, endpoint = alternating[-2], alternating[-1]
+    if origin["type"] == endpoint["type"]:
+        return None, "Le dernier swing n'est pas encore exploitable."
 
-        return {
-            "state": "BEAR",
-            "label": "🔴 SCÉNARIO 2 — TENDANCE BAISSIÈRE CONFIRMÉE",
-            "color": "red",
-            "details": "Prix < EMA50 < EMA100 < EMA200; les trois EMA descendent et aucun rebond haussier récent n'est détecté."
-        }
+    atr = float(data.iloc[-1].get("ATR14", float("nan")))
+    leg_size = abs(endpoint["price"] - origin["price"])
+    if pd.isna(atr) or atr <= 0 or leg_size < min_leg_atr * atr:
+        return None, "Dernier mouvement trop faible pour produire un Fibonacci valide."
+
+    bullish = origin["type"] == "LOW" and endpoint["type"] == "HIGH"
+    bearish = origin["type"] == "HIGH" and endpoint["type"] == "LOW"
+    if not (bullish or bearish):
+        return None, "Structure de swing non valide."
+
+    if bullish:
+        levels = {r: endpoint["price"] - leg_size * r for r in (0.382, 0.5, 0.618, 0.786)}
+        zone_low, zone_high = levels[0.618], levels[0.5]
+        invalidated = float(data.iloc[-1]["close"]) < origin["price"]
+        direction = "BULL"
+    else:
+        levels = {r: endpoint["price"] + leg_size * r for r in (0.382, 0.5, 0.618, 0.786)}
+        zone_low, zone_high = levels[0.5], levels[0.618]
+        invalidated = float(data.iloc[-1]["close"]) > origin["price"]
+        direction = "BEAR"
+
+    if invalidated:
+        return None, "Fibonacci invalidé : le prix a dépassé le point de départ du mouvement."
 
     return {
-        "state": "NONE",
-        "label": "⚪ Aucun scénario confirmé",
-        "color": "gray",
-        "details": "L'alignement complet et la pente commune des EMA ne sont pas réunis."
-    }
+        "direction": direction,
+        "origin": origin,
+        "endpoint": endpoint,
+        "levels": levels,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "leg_size": leg_size,
+        "atr": atr,
+    }, "Dernier swing confirmé et Fibonacci valide."
+
+
+def evaluate_fibonacci_setup(df, current_price=None):
+    """Détecte un retour dans la zone 50–61,8 % puis une confirmation clôturée."""
+    fib, fib_message = find_last_fibonacci(df)
+    if fib is None:
+        return {
+            "state": "WAIT", "label": "⚪ En attente d'un Fibonacci valide",
+            "color": "gray", "details": fib_message, "fib": None
+        }
+
+    direction = fib["direction"]
+    zone_low, zone_high = fib["zone_low"], fib["zone_high"]
+    recent = df.tail(4).reset_index(drop=True)
+    if len(recent) < 3:
+        return {
+            "state": "WAIT", "label": "⚪ En attente de confirmation",
+            "color": "gray", "details": "Pas assez de chandelles clôturées.", "fib": fib
+        }
+
+    # Le prix doit avoir visité la zone récemment, puis clôturer hors de la zone
+    # dans le sens de l'impulsion avec une cassure de la chandelle précédente.
+    touch = any(
+        float(row["low"]) <= zone_high and float(row["high"]) >= zone_low
+        for _, row in recent.iloc[:-1].iterrows()
+    )
+    last = recent.iloc[-1]
+    previous = recent.iloc[-2]
+    live = current_price if current_price is not None else float(last["close"])
+
+    if direction == "BULL":
+        confirmed = (
+            touch and float(last["close"]) > float(last["open"])
+            and float(last["close"]) > float(previous["high"])
+            and float(last["close"]) > zone_high
+        )
+        in_zone = zone_low <= live <= zone_high
+        label = "🟢 ACHAT — REBOND FIBONACCI CONFIRMÉ"
+        wait_label = "🟡 Fibonacci haussier — attente du rebond"
+        details = "Impulsion haussière; retour dans la zone 50–61,8 % puis clôture haussière de confirmation."
+    else:
+        confirmed = (
+            touch and float(last["close"]) < float(last["open"])
+            and float(last["close"]) < float(previous["low"])
+            and float(last["close"]) < zone_low
+        )
+        in_zone = zone_low <= live <= zone_high
+        label = "🔴 VENTE — REJET FIBONACCI CONFIRMÉ"
+        wait_label = "🟡 Fibonacci baissier — attente du rejet"
+        details = "Impulsion baissière; retour dans la zone 50–61,8 % puis clôture baissière de confirmation."
+
+    if confirmed:
+        return {"state": direction + "_CONFIRMED", "label": label,
+                "color": "green" if direction == "BULL" else "red",
+                "details": details, "fib": fib}
+
+    if in_zone or touch:
+        extra = "Le prix est dans la zone." if in_zone else "La zone a été visitée; la confirmation manque encore."
+        return {"state": direction + "_WAIT", "label": wait_label,
+                "color": "orange", "details": extra + " " + details, "fib": fib}
+
+    return {"state": direction + "_TRACKING", "label": "🔵 Fibonacci valide — surveillance du retracement",
+            "color": "blue", "details": "Le prix n'a pas encore confirmé un retour dans la zone 50–61,8 %. " + details,
+            "fib": fib}
 
 
 # ALERT STATE: no repeated alert every minute for the same active setup
-def process_trend_alert(pair, timeframe, trend, candle_time):
-    state_key = f"ema_alert_state_{pair}_{timeframe}"
+def process_fibonacci_alert(pair, timeframe, setup, candle_time):
+    state_key = f"fib_alert_state_{pair}_{timeframe}"
     previous_state = st.session_state.get(state_key, "INIT")
-    st.session_state[state_key] = trend["state"]
+    st.session_state[state_key] = setup["state"]
 
-    is_new_signal = (
-        trend["state"] in ("BULL", "BEAR")
-        and trend["state"] != previous_state
-    )
+    is_new_signal = setup["state"] in ("BULL_CONFIRMED", "BEAR_CONFIRMED") and setup["state"] != previous_state
     if not is_new_signal:
         return
 
-    if trend["state"] == "BULL":
-        subject = f"🟢 Signal ACHAT — {pair} {timeframe}"
-        body = (
-            f"Signal haussier confirmé sur {pair} en {timeframe}.\n"
-            "Condition : Prix > EMA50 > EMA100 > EMA200.\n"
-            "Les trois moyennes mobiles montent.\n"
-            f"Dernière chandelle clôturée : {candle_time}.\n\n"
-            "Biais de tendance seulement; pas un ordre automatique."
-        )
-        voice_url = VOICE_STRONG_BULL
-    else:
-        subject = f"🔴 Signal VENTE — {pair} {timeframe}"
-        body = (
-            f"Signal baissier confirmé sur {pair} en {timeframe}.\n"
-            "Condition : Prix < EMA50 < EMA100 < EMA200.\n"
-            "Les trois moyennes mobiles descendent.\n"
-            f"Dernière chandelle clôturée : {candle_time}.\n\n"
-            "Biais de tendance seulement; pas un ordre automatique."
-        )
-        voice_url = VOICE_STRONG_BEAR
+    bullish = setup["state"] == "BULL_CONFIRMED"
+    subject = f"{'🟢 Signal ACHAT' if bullish else '🔴 Signal VENTE'} Fibonacci — {pair} {timeframe}"
+    fib = setup["fib"]
+    body = (
+        f"Configuration Fibonacci confirmée sur {pair} en {timeframe}.\n"
+        f"Direction : {'haussière' if bullish else 'baissière'}.\n"
+        f"Zone 50–61,8 % : {fib['zone_low']:.5f} à {fib['zone_high']:.5f}.\n"
+        f"Dernière chandelle clôturée : {candle_time}.\n\n"
+        "Signal de configuration à valider manuellement; aucun ordre automatique."
+    )
+    voice_url = VOICE_STRONG_BULL if bullish else VOICE_STRONG_BEAR
 
-    st.session_state.setdefault("ema_new_alerts", [])
-    st.session_state["ema_new_alerts"].append({
+    st.session_state.setdefault("fib_new_alerts", [])
+    st.session_state["fib_new_alerts"].append({
         "Heure": datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"),
-        "Instrument": pair,
-        "Timeframe": timeframe,
-        "Signal": subject
+        "Instrument": pair, "Timeframe": timeframe, "Signal": subject
     })
-
     if not mute_alerts:
         play_voice_alert(voice_url)
-
     if email_alerts_enabled:
         sent, status = send_email_alert(subject, body)
         if not sent and "non configurés" not in status:
@@ -323,11 +372,8 @@ def process_trend_alert(pair, timeframe, trend, candle_time):
 
 
 # MAIN DASHBOARD
-st.title("Trading Monitor — EMA Trend Alerts")
-st.caption(
-    "Alertes basées sur l'alignement du prix, l'ordre des EMA50/100/200 "
-    "et la pente des trois moyennes."
-)
+st.title("Trading Monitor — Fibonacci Setup Alerts")
+st.caption("Alertes basées sur le dernier swing confirmé, le retracement Fibonacci 50–61,8 % et une chandelle de confirmation.")
 
 for config in instruments_config:
     pair = config["pair"]
@@ -349,27 +395,29 @@ for config in instruments_config:
 
         df = add_indicators(closed_df)
         current_price = get_current_price(pair)
-        trend = evaluate_ema_scenario(df, current_price)
+        setup = evaluate_fibonacci_setup(df, current_price)
         last = df.iloc[-1]
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
 
-        process_trend_alert(pair, timeframe, trend, candle_time)
+        process_fibonacci_alert(pair, timeframe, setup, candle_time)
 
         if current_price is not None:
             st.write(f"💵 Prix actuel OANDA : **{current_price:.5f}**")
 
         st.markdown(
-            f"<h4 style='color:{trend['color']};'>{trend['label']}</h4>",
+            f"<h4 style='color:{setup['color']};'>{setup['label']}</h4>",
             unsafe_allow_html=True
         )
-        st.write(trend["details"])
+        st.write(setup["details"])
         st.caption(f"Signal calculé sur la dernière chandelle clôturée : {candle_time}")
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("EMA50", f"{last['EMA50']:.5f}")
-        col2.metric("EMA100", f"{last['EMA100']:.5f}")
-        col3.metric("EMA200", f"{last['EMA200']:.5f}")
-        col4.metric("ADX14", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
+        col1, col2 = st.columns(2)
+        col1.metric("ADX14", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
+        col2.metric("Fibonacci", "Valide" if setup.get("fib") else "En attente")
+        if setup.get("fib"):
+            fib = setup["fib"]
+            st.write(f"**Zone Fibonacci 50–61,8 % :** {fib['zone_low']:.5f} – {fib['zone_high']:.5f}")
+            st.write(f"**Origine du swing :** {fib['origin']['price']:.5f}  |  **Extrémité :** {fib['endpoint']['price']:.5f}")
 
         # CHART
         fig = make_subplots(
@@ -377,29 +425,31 @@ for config in instruments_config:
             row_heights=[0.7, 0.3], vertical_spacing=0.05
         )
         fig.add_trace(
-            go.Scatter(
-                x=df["time"], y=df["close"], name="Close",
-                line=dict(color="gray", dash="dot")
-            ), row=1, col=1
+            go.Scatter(x=df["time"], y=df["close"], name="Close",
+                       line=dict(color="gray", dash="dot")), row=1, col=1
         )
-        fig.add_trace(
-            go.Scatter(
-                x=df["time"], y=df["EMA50"], name="EMA50",
-                line=dict(color="blue", width=2)
-            ), row=1, col=1
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=df["time"], y=df["EMA100"], name="EMA100",
-                line=dict(color="gray", dash="dash", width=2)
-            ), row=1, col=1
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=df["time"], y=df["EMA200"], name="EMA200",
-                line=dict(color="orange", width=2)
-            ), row=1, col=1
-        )
+        if show_emas:
+            for ema_name, ema_color, ema_dash in [
+                ("EMA50", "blue", "solid"),
+                ("EMA100", "gray", "dash"),
+                ("EMA200", "orange", "solid")
+            ]:
+                fig.add_trace(
+                    go.Scatter(x=df["time"], y=df[ema_name], name=ema_name,
+                               line=dict(color=ema_color, dash=ema_dash, width=2)), row=1, col=1
+                )
+        if setup.get("fib"):
+            fib = setup["fib"]
+            x0 = fib["origin"]["time"]
+            x1 = df["time"].iloc[-1]
+            for ratio, level in fib["levels"].items():
+                fig.add_trace(go.Scatter(
+                    x=[x0, x1], y=[level, level], mode="lines",
+                    name=f"Fib {ratio * 100:.1f}%", line=dict(width=1, dash="dot")
+                ), row=1, col=1)
+            fig.add_hrect(y0=fib["zone_low"], y1=fib["zone_high"],
+                          fillcolor="rgba(255, 190, 0, 0.15)", line_width=0,
+                          annotation_text="Zone Fib 50–61,8 %", row=1, col=1)
         fig.add_trace(
             go.Bar(
                 x=df["time"], y=df["volume"], name="Volume",
@@ -419,12 +469,12 @@ for config in instruments_config:
 
 # RECENT ALERTS
 st.markdown("---")
-st.subheader("🔔 Alertes EMA récentes")
-recent_alerts = st.session_state.get("ema_new_alerts", [])
+st.subheader("🔔 Alertes Fibonacci récentes")
+recent_alerts = st.session_state.get("fib_new_alerts", [])
 if recent_alerts:
     st.dataframe(pd.DataFrame(recent_alerts[::-1]), use_container_width=True, hide_index=True)
 else:
-    st.info("Aucune nouvelle alerte EMA depuis l'ouverture du dashboard.")
+    st.info("Aucune nouvelle alerte Fibonacci depuis l'ouverture du dashboard.")
 
 
 # PROFIT / LOSS LAST 7 DAYS
