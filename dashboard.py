@@ -589,46 +589,24 @@ for config in instruments_config:
             fib = setup["fib"]
             x0 = fib["origin"]["time"]
             x1 = df["time"].iloc[-1]
-            # Couleurs volontairement indépendantes du sens achat/vente :
-            # la zone reste neutre pour ne pas masquer les lignes Fibonacci.
-            fib_styles = {
-                0.382: ("#42A5F5", "dash", 2),
-                0.5: ("#FFD740", "solid", 4),
-                0.618: ("#00E5FF", "solid", 4),
-                0.786: ("#F062FF", "dot", 3),
-            }
-            for ratio, level in fib["levels"].items():
-                fib_color, fib_dash, fib_width = fib_styles[ratio]
-                level_label = {
-                    0.382: "38,2 %",
-                    0.5: "50 % — limite zone",
-                    0.618: "61,8 % — limite zone",
-                    0.786: "78,6 % — secondaire",
-                }[ratio]
+
+            # Affichage classique : seulement les niveaux 0, 0.5 et 1.
+            # Les calculs internes du setup (zone 50–61,8 %, signaux et plans)
+            # restent inchangés.
+            visible_levels = [
+                (0.0, float(fib["endpoint"]["price"]), "Fibonacci 0", "#42A5F5", "solid", 2),
+                (0.5, float(fib["levels"][0.5]), "Fibonacci 0.5", "#FFD740", "solid", 3),
+                (1.0, float(fib["origin"]["price"]), "Fibonacci 1", "#00E5FF", "solid", 2),
+            ]
+
+            for ratio, level, level_name, fib_color, fib_dash, fib_width in visible_levels:
                 fig.add_trace(go.Scatter(
                     x=[x0, x1], y=[level, level], mode="lines",
-                    name=f"Fibonacci {level_label}",
+                    name=level_name,
                     line=dict(color=fib_color, width=fib_width, dash=fib_dash),
-                    hovertemplate=f"{level_label}<br>%{{y:.5f}}<extra></extra>"
+                    hovertemplate=f"{level_name}<br>%{{y:.5f}}<extra></extra>"
                 ), row=1, col=1)
 
-            zone_label = (
-                "ZONE DE VENTE 50–61,8 %"
-                if fib["direction"] == "BEAR"
-                else "ZONE D'ACHAT 50–61,8 %"
-            )
-
-            # Fond bleu ardoise très léger : ni rouge ni vert.
-            # Les deux limites restent visibles en jaune et cyan.
-            fig.add_hrect(
-                y0=fib["zone_low"], y1=fib["zone_high"],
-                fillcolor="rgba(80, 105, 135, 0.16)",
-                line_color="#E6EDF5", line_width=2,
-                annotation_text=zone_label,
-                annotation_position="top left",
-                annotation_font=dict(color="#FFFFFF", size=13),
-                row=1, col=1
-            )
         fig.add_trace(
             go.Bar(
                 x=df["time"], y=df["volume"], name="Volume",
