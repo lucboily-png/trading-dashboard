@@ -261,9 +261,48 @@ def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
     }, "Dernier swing confirmé et Fibonacci valide."
 
 
+
+def build_manual_fibonacci(df, high_time, high_price, low_time, low_price):
+    """Construit un Fibonacci à partir de deux points choisis par l'utilisateur."""
+    data = df.reset_index(drop=True)
+    high_price, low_price = float(high_price), float(low_price)
+    if high_price <= low_price:
+        return None, "Le sommet doit être supérieur au creux."
+    atr = data.iloc[-1].get("ATR14")
+    if pd.isna(atr) or float(atr) <= 0:
+        return None, "ATR14 indisponible."
+
+    hi = data.index[data["time"].astype(str) == str(high_time)].tolist()
+    lo = data.index[data["time"].astype(str) == str(low_time)].tolist()
+    if not hi or not lo:
+        return None, "Les chandelles choisies ne sont plus disponibles."
+    hi, lo = hi[0], lo[0]
+    if hi == lo:
+        return None, "Choisis deux chandelles différentes."
+
+    high_point = {"index": hi, "type": "HIGH", "price": high_price, "time": data.loc[hi, "time"]}
+    low_point = {"index": lo, "type": "LOW", "price": low_price, "time": data.loc[lo, "time"]}
+    if lo < hi:
+        origin, endpoint, direction = low_point, high_point, "BULL"
+        levels = {r: high_price - (high_price - low_price) * r for r in (0.382, 0.5, 0.618, 0.786)}
+        zone_low, zone_high = levels[0.618], levels[0.5]
+    else:
+        origin, endpoint, direction = high_point, low_point, "BEAR"
+        levels = {r: low_price + (high_price - low_price) * r for r in (0.382, 0.5, 0.618, 0.786)}
+        zone_low, zone_high = levels[0.5], levels[0.618]
+
+    return {
+        "direction": direction, "origin": origin, "endpoint": endpoint,
+        "levels": levels, "zone_low": zone_low, "zone_high": zone_high,
+        "leg_size": high_price - low_price, "atr": float(atr), "manual": True,
+    }, "Fibonacci manuel actif."
+
+
+
 def evaluate_fibonacci_setup(
     df,
     current_price=None,
+    fib_override=None,
     max_close_extension_atr=0.50,
     max_live_extension_atr=0.35
 ):
@@ -273,7 +312,7 @@ def evaluate_fibonacci_setup(
     de la zone, ou si le prix en direct a déjà trop prolongé le mouvement.
     Les seuils sont exprimés en multiples de l'ATR14 du timeframe sélectionné.
     """
-    fib, fib_message = find_last_fibonacci(df)
+    fib, fib_message = (fib_override, 'Fibonacci manuel actif.') if fib_override is not None else find_last_fibonacci(df)
     if fib is None:
         return {
             "state": "WAIT", "label": "⚪ En attente d'un Fibonacci valide",
@@ -520,8 +559,76 @@ for config in instruments_config:
         # Utilise la dernière chandelle reçue (potentiellement en formation) comme prix courant.
         # Cela évite une requête M1 OANDA supplémentaire pour chaque instrument.
         current_price = float(raw_df.iloc[-1]["close"])
-        setup = evaluate_fibonacci_setup(df, current_price)
         last = df.iloc[-1]
+
+        fib_mode = st.radio(
+            "Méthode Fibonacci", ["Automatique", "Manuel"],
+            horizontal=True, key=f"fib_mode_{pair}_{timeframe}",
+            help="En mode manuel, choisis les chandelles du sommet et du creux, puis ajuste leurs prix."
+        )
+        fib_override = None
+        if fib_mode == "Manuel":
+            st.caption(
+                "Choisis la chandelle du sommet et celle du creux. Ajuste ensuite leurs prix. "
+                "L'ordre chronologique détermine automatiquement le sens du swing."
+            )
+            time_options = [str(value) for value in df["time"].tolist()]
+            time_labels = {
+                str(value): pd.Timestamp(value).strftime("%Y-%m-%d %H:%M NY")
+                for value in df["time"].tolist()
+            }
+            hi_default, lo_default = int(df["high"].idxmax()), int(df["low"].idxmin())
+            hi_t_key, lo_t_key = f"fib_hi_t_{pair}_{timeframe}", f"fib_lo_t_{pair}_{timeframe}"
+            hi_p_key, lo_p_key = f"fib_hi_p_{pair}_{timeframe}", f"fib_lo_p_{pair}_{timeframe}"
+
+            if hi_t_key not in st.session_state:
+                st.session_state[hi_t_key] = str(df.loc[hi_default, "time"])
+            if lo_t_key not in st.session_state:
+                st.session_state[lo_t_key] = str(df.loc[lo_default, "time"])
+            if hi_p_key not in st.session_state:
+                st.session_state[hi_p_key] = float(df.loc[hi_default, "high"])
+            if lo_p_key not in st.session_state:
+                st.session_state[lo_p_key] = float(df.loc[lo_default, "low"])
+
+            def update_hi_price():
+                selected = st.session_state[hi_t_key]
+                row = df[df["time"].astype(str) == selected].iloc[0]
+                st.session_state[hi_p_key] = float(row["high"])
+
+            def update_lo_price():
+                selected = st.session_state[lo_t_key]
+                row = df[df["time"].astype(str) == selected].iloc[0]
+                st.session_state[lo_p_key] = float(row["low"])
+
+            c_hi, c_lo = st.columns(2)
+            with c_hi:
+                st.selectbox("Chandelle du sommet (0)", time_options,
+                             format_func=lambda v: time_labels.get(v, v),
+                             key=hi_t_key, on_change=update_hi_price)
+                st.number_input("Prix du sommet", key=hi_p_key, format="%.5f")
+            with c_lo:
+                st.selectbox("Chandelle du creux (1)", time_options,
+                             format_func=lambda v: time_labels.get(v, v),
+                             key=lo_t_key, on_change=update_lo_price)
+                st.number_input("Prix du creux", key=lo_p_key, format="%.5f")
+
+            fib_override, manual_status = build_manual_fibonacci(
+                df, st.session_state[hi_t_key], st.session_state[hi_p_key],
+                st.session_state[lo_t_key], st.session_state[lo_p_key]
+            )
+            if fib_override is None:
+                st.warning(manual_status)
+
+        if fib_mode == "Manuel" and fib_override is None:
+            setup = {
+                "state": "WAIT",
+                "label": "⚪ Fibonacci manuel à corriger",
+                "color": "gray",
+                "details": "Aucun signal calculé : vérifie les deux chandelles et les prix des ancrages manuels.",
+                "fib": None
+            }
+        else:
+            setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override)
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
 
         process_fibonacci_alert(pair, timeframe, setup, candle_time)
@@ -605,6 +712,17 @@ for config in instruments_config:
                     name=level_name,
                     line=dict(color=fib_color, width=fib_width, dash=fib_dash),
                     hovertemplate=f"{level_name}<br>%{{y:.5f}}<extra></extra>"
+                ), row=1, col=1)
+            if fib.get("manual"):
+                fig.add_trace(go.Scatter(
+                    x=[fib["origin"]["time"], fib["endpoint"]["time"]],
+                    y=[fib["origin"]["price"], fib["endpoint"]["price"]],
+                    mode="markers+text",
+                    text=["Ancrage 1", "Ancrage 0"],
+                    textposition="top center",
+                    marker=dict(size=11, color="white", line=dict(color="black", width=2)),
+                    name="Ancrages manuels",
+                    hovertemplate="Ancrage<br>%{y:.5f}<extra></extra>"
                 ), row=1, col=1)
 
         fig.add_trace(
