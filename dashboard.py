@@ -401,6 +401,60 @@ def evaluate_fibonacci_setup(
     }
 
 
+def build_trade_plan(setup, current_price, min_rr=1.5, stop_buffer_atr=0.20):
+    """Construit un plan indicatif uniquement après confirmation et filtre anti-retard.
+
+    Entrée = prix médian courant observé dans la chandelle en formation.
+    SL = au-delà du bord externe de la zone Fibonacci + marge ATR.
+    TP = extrémité du swing initial. Le plan est rejeté si le RR est inférieur
+    au minimum ou si le prix a déjà dépassé la cible.
+    """
+    if setup.get("state") not in ("BULL_CONFIRMED", "BEAR_CONFIRMED"):
+        return None, "Aucun plan : attendre une confirmation Fibonacci non tardive."
+
+    fib = setup.get("fib")
+    if not fib or current_price is None:
+        return None, "Aucun plan : prix courant ou Fibonacci indisponible."
+
+    entry = float(current_price)
+    atr = float(fib["atr"])
+    buffer = atr * stop_buffer_atr
+    target = float(fib["endpoint"]["price"])
+
+    if fib["direction"] == "BEAR":
+        stop = float(fib["zone_high"]) + buffer
+        if not (target < entry < stop):
+            return None, "Aucun plan : le prix est déjà au niveau de la cible ou la structure risque/rendement est invalide."
+        risk = stop - entry
+        reward = entry - target
+        side = "VENTE"
+    else:
+        stop = float(fib["zone_low"]) - buffer
+        if not (stop < entry < target):
+            return None, "Aucun plan : le prix est déjà au niveau de la cible ou la structure risque/rendement est invalide."
+        risk = entry - stop
+        reward = target - entry
+        side = "ACHAT"
+
+    rr_value = reward / risk if risk > 0 else 0.0
+    if rr_value < min_rr:
+        return None, (
+            f"Aucun plan proposé : le rendement jusqu'à l'extrémité du swing "
+            f"n'offre que 1:{rr_value:.2f}, sous le minimum de 1:{min_rr:.2f}."
+        )
+
+    return {
+        "side": side,
+        "entry": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "rr": rr_value,
+        "risk_distance": risk,
+        "reward_distance": reward,
+        "buffer": buffer,
+    }, "Plan indicatif calculé à partir du prix observé et du swing Fibonacci."
+
+
 # ALERT STATE: no repeated alert every minute for the same active setup
 def process_fibonacci_alert(pair, timeframe, setup, candle_time):
     state_key = f"fib_alert_state_{pair}_{timeframe}"
@@ -491,6 +545,27 @@ for config in instruments_config:
             st.write(f"**{zone_name} Fibonacci 50–61,8 % :** {fib['zone_low']:.5f} – {fib['zone_high']:.5f}")
             st.write(f"**Origine du swing :** {fib['origin']['price']:.5f}  |  **Extrémité :** {fib['endpoint']['price']:.5f}")
 
+        st.markdown("#### Plan de trade Fibonacci")
+        trade_plan, trade_message = build_trade_plan(setup, current_price)
+        if trade_plan:
+            st.success(
+                f"PLAN INDICATIF {trade_plan['side']} — "
+                f"R/R 1:{trade_plan['rr']:.2f}"
+            )
+            plan_c1, plan_c2, plan_c3 = st.columns(3)
+            plan_c1.metric("Entrée indicative", f"{trade_plan['entry']:.5f}")
+            plan_c2.metric("Stop-loss", f"{trade_plan['stop_loss']:.5f}")
+            plan_c3.metric("Take-profit", f"{trade_plan['take_profit']:.5f}")
+            st.caption(
+                f"SL placé au-delà de la zone avec une marge de 0,20 ATR. "
+                f"TP placé à l'extrémité du swing. Risque : "
+                f"{trade_plan['risk_distance']:.5f} | Récompense : "
+                f"{trade_plan['reward_distance']:.5f}. "
+                "À valider manuellement; aucun ordre n'est envoyé."
+            )
+        else:
+            st.info(trade_message)
+
         # CHART
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True,
@@ -518,13 +593,13 @@ for config in instruments_config:
                 0.382: ("#00C8FF", "dash", 2),
                 0.5: ("#FFD000", "solid", 3),
                 0.618: ("#FF4B4B", "solid", 3),
-                0.786: ("#B58CFF", "dash", 2),
+                0.786: ("#F2F2F2", "longdashdot", 2),
             }
             for ratio, level in fib["levels"].items():
                 fib_color, fib_dash, fib_width = fib_styles[ratio]
                 fig.add_trace(go.Scatter(
                     x=[x0, x1], y=[level, level], mode="lines",
-                    name=f"Fib {ratio * 100:.1f}%",
+                    name=("Fib 78,6 % — niveau secondaire" if ratio == 0.786 else f"Fib {ratio * 100:.1f}%"),
                     line=dict(color=fib_color, width=fib_width, dash=fib_dash)
                 ), row=1, col=1)
 
