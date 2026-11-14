@@ -122,6 +122,7 @@ st.sidebar.caption("Les alertes reposent sur le dernier Fibonacci valide, pas su
 
 
 # OANDA DATA
+@st.cache_data(ttl=45, show_spinner=False)
 def get_data(pair, granularity="M30", count=300):
     request = instruments.InstrumentsCandles(
         instrument=pair,
@@ -148,18 +149,6 @@ def get_data(pair, granularity="M30", count=300):
     df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert("America/New_York")
     return df
 
-
-def get_current_price(pair):
-    try:
-        request = instruments.InstrumentsCandles(
-            instrument=pair,
-            params={"count": 1, "granularity": "M1", "price": "M"}
-        )
-        client.request(request)
-        candles = request.response.get("candles", [])
-        return float(candles[-1]["mid"]["c"]) if candles else None
-    except Exception:
-        return None
 
 
 # INDICATORS
@@ -273,7 +262,7 @@ def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
 
 
 def evaluate_fibonacci_setup(df, current_price=None):
-    """Détecte un retour dans la zone 50–61,8 % puis une confirmation clôturée."""
+    """Détecte un retracement récent dans la zone 50–61,8 % puis une confirmation clôturée."""
     fib, fib_message = find_last_fibonacci(df)
     if fib is None:
         return {
@@ -283,22 +272,24 @@ def evaluate_fibonacci_setup(df, current_price=None):
 
     direction = fib["direction"]
     zone_low, zone_high = fib["zone_low"], fib["zone_high"]
-    recent = df.tail(4).reset_index(drop=True)
-    if len(recent) < 3:
+    data = df.reset_index(drop=True)
+    if len(data) < 3:
         return {
             "state": "WAIT", "label": "⚪ En attente de confirmation",
             "color": "gray", "details": "Pas assez de chandelles clôturées.", "fib": fib
         }
 
-    # Le prix doit avoir visité la zone récemment, puis clôturer hors de la zone
-    # dans le sens de l'impulsion avec une cassure de la chandelle précédente.
+    last = data.iloc[-1]
+    previous = data.iloc[-2]
+    live = current_price if current_price is not None else float(last["close"])
+
+    endpoint_index = int(fib["endpoint"]["index"])
+    touch_start = max(endpoint_index + 1, len(data) - 9)
+    retest_candles = data.iloc[touch_start:]
     touch = any(
         float(row["low"]) <= zone_high and float(row["high"]) >= zone_low
-        for _, row in recent.iloc[:-1].iterrows()
+        for _, row in retest_candles.iterrows()
     )
-    last = recent.iloc[-1]
-    previous = recent.iloc[-2]
-    live = current_price if current_price is not None else float(last["close"])
 
     if direction == "BULL":
         confirmed = (
@@ -308,8 +299,9 @@ def evaluate_fibonacci_setup(df, current_price=None):
         )
         in_zone = zone_low <= live <= zone_high
         label = "🟢 ACHAT — REBOND FIBONACCI CONFIRMÉ"
-        wait_label = "🟡 Fibonacci haussier — attente du rebond"
-        details = "Impulsion haussière; retour dans la zone 50–61,8 % puis clôture haussière de confirmation."
+        wait_label = "🟡 Zone d'achat Fibonacci — attente du rebond"
+        zone_name = "ZONE D'ACHAT"
+        details = "Swing haussier : le prix doit revenir dans la zone 50–61,8 %, puis clôturer à la hausse avec une cassure de la chandelle précédente."
     else:
         confirmed = (
             touch and float(last["close"]) < float(last["open"])
@@ -318,22 +310,33 @@ def evaluate_fibonacci_setup(df, current_price=None):
         )
         in_zone = zone_low <= live <= zone_high
         label = "🔴 VENTE — REJET FIBONACCI CONFIRMÉ"
-        wait_label = "🟡 Fibonacci baissier — attente du rejet"
-        details = "Impulsion baissière; retour dans la zone 50–61,8 % puis clôture baissière de confirmation."
+        wait_label = "🟡 Zone de vente Fibonacci — attente du rejet"
+        zone_name = "ZONE DE VENTE"
+        details = "Swing baissier : le prix doit remonter dans la zone 50–61,8 %, puis clôturer à la baisse avec une cassure de la chandelle précédente."
 
     if confirmed:
-        return {"state": direction + "_CONFIRMED", "label": label,
-                "color": "green" if direction == "BULL" else "red",
-                "details": details, "fib": fib}
+        return {
+            "state": direction + "_CONFIRMED", "label": label,
+            "color": "green" if direction == "BULL" else "red",
+            "details": details, "fib": fib, "zone_name": zone_name,
+            "touch": touch, "in_zone": in_zone
+        }
 
     if in_zone or touch:
-        extra = "Le prix est dans la zone." if in_zone else "La zone a été visitée; la confirmation manque encore."
-        return {"state": direction + "_WAIT", "label": wait_label,
-                "color": "orange", "details": extra + " " + details, "fib": fib}
+        extra = "Le prix actuel est dans la zone. " if in_zone else "La zone a été visitée récemment; la confirmation manque encore. "
+        return {
+            "state": direction + "_WAIT", "label": wait_label,
+            "color": "orange", "details": extra + details, "fib": fib,
+            "zone_name": zone_name, "touch": touch, "in_zone": in_zone
+        }
 
-    return {"state": direction + "_TRACKING", "label": "🔵 Fibonacci valide — surveillance du retracement",
-            "color": "blue", "details": "Le prix n'a pas encore confirmé un retour dans la zone 50–61,8 %. " + details,
-            "fib": fib}
+    return {
+        "state": direction + "_TRACKING",
+        "label": "🔵 Fibonacci valide — surveillance du retracement",
+        "color": "blue",
+        "details": f"{zone_name} : le prix n'a pas encore atteint la zone 50–61,8 %. " + details,
+        "fib": fib, "zone_name": zone_name, "touch": False, "in_zone": in_zone
+    }
 
 
 # ALERT STATE: no repeated alert every minute for the same active setup
@@ -394,7 +397,9 @@ for config in instruments_config:
             continue
 
         df = add_indicators(closed_df)
-        current_price = get_current_price(pair)
+        # Utilise la dernière chandelle reçue (potentiellement en formation) comme prix courant.
+        # Cela évite une requête M1 OANDA supplémentaire pour chaque instrument.
+        current_price = float(raw_df.iloc[-1]["close"])
         setup = evaluate_fibonacci_setup(df, current_price)
         last = df.iloc[-1]
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
@@ -416,7 +421,8 @@ for config in instruments_config:
         col2.metric("Fibonacci", "Valide" if setup.get("fib") else "En attente")
         if setup.get("fib"):
             fib = setup["fib"]
-            st.write(f"**Zone Fibonacci 50–61,8 % :** {fib['zone_low']:.5f} – {fib['zone_high']:.5f}")
+            zone_name = setup.get("zone_name", "ZONE DE RETRACEMENT")
+            st.write(f"**{zone_name} Fibonacci 50–61,8 % :** {fib['zone_low']:.5f} – {fib['zone_high']:.5f}")
             st.write(f"**Origine du swing :** {fib['origin']['price']:.5f}  |  **Extrémité :** {fib['endpoint']['price']:.5f}")
 
         # CHART
@@ -442,14 +448,34 @@ for config in instruments_config:
             fib = setup["fib"]
             x0 = fib["origin"]["time"]
             x1 = df["time"].iloc[-1]
+            fib_styles = {
+                0.382: ("#00C8FF", "dash", 2),
+                0.5: ("#FFD000", "solid", 3),
+                0.618: ("#FF4B4B", "solid", 3),
+                0.786: ("#B58CFF", "dash", 2),
+            }
             for ratio, level in fib["levels"].items():
+                fib_color, fib_dash, fib_width = fib_styles[ratio]
                 fig.add_trace(go.Scatter(
                     x=[x0, x1], y=[level, level], mode="lines",
-                    name=f"Fib {ratio * 100:.1f}%", line=dict(width=1, dash="dot")
+                    name=f"Fib {ratio * 100:.1f}%",
+                    line=dict(color=fib_color, width=fib_width, dash=fib_dash)
                 ), row=1, col=1)
-            fig.add_hrect(y0=fib["zone_low"], y1=fib["zone_high"],
-                          fillcolor="rgba(255, 190, 0, 0.15)", line_width=0,
-                          annotation_text="Zone Fib 50–61,8 %", row=1, col=1)
+
+            if fib["direction"] == "BEAR":
+                zone_fill, zone_border = "rgba(220, 35, 55, 0.30)", "#FF5268"
+                zone_label = "ZONE DE VENTE 50–61,8 %"
+            else:
+                zone_fill, zone_border = "rgba(0, 170, 105, 0.30)", "#00D68F"
+                zone_label = "ZONE D'ACHAT 50–61,8 %"
+
+            fig.add_hrect(
+                y0=fib["zone_low"], y1=fib["zone_high"],
+                fillcolor=zone_fill, line_color=zone_border, line_width=2,
+                annotation_text=zone_label, annotation_position="top left",
+                annotation_font=dict(color=zone_border, size=13),
+                row=1, col=1
+            )
         fig.add_trace(
             go.Bar(
                 x=df["time"], y=df["volume"], name="Volume",
@@ -458,10 +484,11 @@ for config in instruments_config:
         )
         fig.update_layout(
             height=700, template="plotly_dark",
-            margin=dict(l=20, r=20, t=35, b=20),
-            legend=dict(orientation="h", y=1.02, x=0)
+            margin=dict(l=20, r=20, t=55, b=20),
+            legend=dict(orientation="h", y=1.08, x=0),
+            hovermode="x unified"
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     except Exception as exc:
         st.error(f"Erreur pour {pair} ({timeframe}) : {exc}")
@@ -472,7 +499,7 @@ st.markdown("---")
 st.subheader("🔔 Alertes Fibonacci récentes")
 recent_alerts = st.session_state.get("fib_new_alerts", [])
 if recent_alerts:
-    st.dataframe(pd.DataFrame(recent_alerts[::-1]), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(recent_alerts[::-1]), width="stretch", hide_index=True)
 else:
     st.info("Aucune nouvelle alerte Fibonacci depuis l'ouverture du dashboard.")
 
@@ -481,7 +508,7 @@ else:
 st.markdown("---")
 st.subheader("📅 Profits / Pertes (7 derniers jours)")
 try:
-    since = (datetime.utcnow() - timedelta(days=7)).isoformat("T") + "Z"
+    since = (datetime.now(pytz.UTC) - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
     request = TransactionList(accountID=ACCOUNT_ID, params={"from": since})
     client.request(request)
     transactions = request.response.get("transactions", [])
@@ -498,7 +525,7 @@ try:
         pnl_df["Status"] = pnl_df["P&L"].apply(
             lambda value: "🟢 Gain" if value >= 0 else "🔴 Perte"
         )
-        st.dataframe(pnl_df, use_container_width=True, hide_index=True)
+        st.dataframe(pnl_df, width="stretch", hide_index=True)
     else:
         st.info("Aucune transaction enregistrée dans les 7 derniers jours.")
 except Exception as exc:
