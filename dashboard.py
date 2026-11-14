@@ -611,14 +611,6 @@ for config in instruments_config:
                     line=dict(color=fib_color, width=fib_width, dash=fib_dash),
                     hovertemplate=f"{level_label}<br>%{{y:.5f}}<extra></extra>"
                 ), row=1, col=1)
-                fig.add_annotation(
-                    x=x1, y=level, xref="x", yref="y",
-                    text=f" {level_label} ",
-                    showarrow=False, xanchor="left",
-                    font=dict(color=fib_color, size=11),
-                    bgcolor="rgba(10, 15, 25, 0.92)",
-                    bordercolor=fib_color, borderwidth=1, borderpad=3
-                )
 
             zone_label = (
                 "ZONE DE VENTE 50–61,8 %"
