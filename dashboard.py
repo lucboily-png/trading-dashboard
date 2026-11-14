@@ -261,8 +261,18 @@ def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
     }, "Dernier swing confirmé et Fibonacci valide."
 
 
-def evaluate_fibonacci_setup(df, current_price=None):
-    """Détecte un retracement récent dans la zone 50–61,8 % puis une confirmation clôturée."""
+def evaluate_fibonacci_setup(
+    df,
+    current_price=None,
+    max_close_extension_atr=0.50,
+    max_live_extension_atr=0.35
+):
+    """Détecte un retracement Fibonacci confirmé et écarte les entrées trop tardives.
+
+    Le signal est refusé si la chandelle de confirmation clôture trop loin
+    de la zone, ou si le prix en direct a déjà trop prolongé le mouvement.
+    Les seuils sont exprimés en multiples de l'ATR14 du timeframe sélectionné.
+    """
     fib, fib_message = find_last_fibonacci(df)
     if fib is None:
         return {
@@ -315,11 +325,63 @@ def evaluate_fibonacci_setup(df, current_price=None):
         details = "Swing baissier : le prix doit remonter dans la zone 50–61,8 %, puis clôturer à la baisse avec une cassure de la chandelle précédente."
 
     if confirmed:
+        # Distance entre la clôture de confirmation et le bord de la zone.
+        # Une extension trop grande signifie que le mouvement est déjà parti.
+        close_price = float(last["close"])
+        if direction == "BEAR":
+            close_extension = max(0.0, zone_low - close_price)
+            live_extension = max(0.0, close_price - float(live))
+        else:
+            close_extension = max(0.0, close_price - zone_high)
+            live_extension = max(0.0, float(live) - close_price)
+
+        atr_value = float(fib["atr"])
+        close_limit = max_close_extension_atr * atr_value
+        live_limit = max_live_extension_atr * atr_value
+
+        too_late_reasons = []
+        if close_extension > close_limit:
+            too_late_reasons.append(
+                f"La chandelle de confirmation a déjà dépassé la zone de "
+                f"{close_extension:.5f} (limite {close_limit:.5f})."
+            )
+        if live_extension > live_limit:
+            too_late_reasons.append(
+                f"Depuis la clôture de confirmation, le prix a prolongé le "
+                f"mouvement de {live_extension:.5f} (limite {live_limit:.5f})."
+            )
+
+        if too_late_reasons:
+            return {
+                "state": direction + "_TOO_LATE",
+                "label": (
+                    "⚠️ VENTE — REJET CONFIRMÉ, ENTRÉE TROP TARDIVE"
+                    if direction == "BEAR"
+                    else "⚠️ ACHAT — REBOND CONFIRMÉ, ENTRÉE TROP TARDIVE"
+                ),
+                "color": "orange",
+                "details": "Le signal technique est apparu, mais le prix est "
+                           "déjà trop éloigné pour proposer une entrée prudente. "
+                           + " ".join(too_late_reasons)
+                           + " Attendre un nouveau retracement; ne pas poursuivre le prix.",
+                "fib": fib, "zone_name": zone_name, "touch": touch,
+                "in_zone": in_zone, "close_extension": close_extension,
+                "live_extension": live_extension,
+                "close_extension_limit": close_limit,
+                "live_extension_limit": live_limit
+            }
+
         return {
             "state": direction + "_CONFIRMED", "label": label,
             "color": "green" if direction == "BULL" else "red",
-            "details": details, "fib": fib, "zone_name": zone_name,
-            "touch": touch, "in_zone": in_zone
+            "details": details + " Filtre anti-retard validé : le prix reste "
+                       "suffisamment proche de la zone pour étudier une entrée.",
+            "fib": fib, "zone_name": zone_name,
+            "touch": touch, "in_zone": in_zone,
+            "close_extension": close_extension,
+            "live_extension": live_extension,
+            "close_extension_limit": close_limit,
+            "live_extension_limit": live_limit
         }
 
     if in_zone or touch:
@@ -376,7 +438,11 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time):
 
 # MAIN DASHBOARD
 st.title("Trading Monitor — Fibonacci Setup Alerts")
-st.caption("Alertes basées sur le dernier swing confirmé, le retracement Fibonacci 50–61,8 % et une chandelle de confirmation.")
+st.caption(
+    "Alertes basées sur le dernier swing confirmé, le retracement Fibonacci "
+    "50–61,8 %, une chandelle de confirmation et un filtre anti-entrée tardive "
+    "(extension maximale de 0,50 ATR à la clôture et 0,35 ATR en direct)."
+)
 
 for config in instruments_config:
     pair = config["pair"]
