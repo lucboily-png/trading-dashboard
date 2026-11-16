@@ -10,6 +10,7 @@ import oandapyV20.endpoints.instruments as instruments
 from oandapyV20.endpoints.transactions import TransactionList
 from streamlit_autorefresh import st_autorefresh
 import smtplib
+from pathlib import Path
 from email.mime.text import MIMEText
 
 st.set_page_config(page_title="Trading Monitor - Fibonacci Alerts", layout="wide")
@@ -495,32 +496,127 @@ def build_trade_plan(setup, current_price, min_rr=1.5, stop_buffer_atr=0.20):
 
 
 # ALERT STATE: no repeated alert every minute for the same active setup
-def process_fibonacci_alert(pair, timeframe, setup, candle_time):
+ALERT_HISTORY_FILE = Path(__file__).resolve().parent / "fib_alert_history.csv"
+
+ALERT_COLUMNS = [
+    "Heure alerte", "Heure chandelle", "Instrument", "Timeframe",
+    "Direction", "Etat", "Zone basse", "Zone haute",
+    "Entree", "Stop-loss", "Take-profit", "R_R",
+    "Prix au signal", "Mode Fibonacci", "Resultat", "Notes"
+]
+
+
+def append_alert_history(record):
+    """Ajoute une alerte au CSV local pour permettre sa consultation et son export."""
+    row = {column: record.get(column, "") for column in ALERT_COLUMNS}
+    one_row = pd.DataFrame([row], columns=ALERT_COLUMNS)
+    try:
+        if ALERT_HISTORY_FILE.exists():
+            one_row.to_csv(ALERT_HISTORY_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
+        else:
+            one_row.to_csv(ALERT_HISTORY_FILE, index=False, encoding="utf-8-sig")
+        return True
+    except Exception as exc:
+        st.warning(f"Impossible d'enregistrer le journal CSV local : {exc}")
+        return False
+
+
+def load_alert_history():
+    """Lit le journal CSV local; retourne un tableau vide s'il n'existe pas."""
+    if not ALERT_HISTORY_FILE.exists():
+        return pd.DataFrame(columns=ALERT_COLUMNS)
+    try:
+        history = pd.read_csv(ALERT_HISTORY_FILE, encoding="utf-8-sig")
+        for column in ALERT_COLUMNS:
+            if column not in history.columns:
+                history[column] = ""
+        return history[ALERT_COLUMNS]
+    except Exception as exc:
+        st.warning(f"Impossible de lire le journal CSV local : {exc}")
+        return pd.DataFrame(columns=ALERT_COLUMNS)
+
+
+def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, trade_plan):
     state_key = f"fib_alert_state_{pair}_{timeframe}"
     previous_state = st.session_state.get(state_key, "INIT")
     st.session_state[state_key] = setup["state"]
 
-    is_new_signal = setup["state"] in ("BULL_CONFIRMED", "BEAR_CONFIRMED") and setup["state"] != previous_state
+    is_new_signal = (
+        setup["state"] in ("BULL_CONFIRMED", "BEAR_CONFIRMED")
+        and setup["state"] != previous_state
+    )
     if not is_new_signal:
         return
 
     bullish = setup["state"] == "BULL_CONFIRMED"
+    direction = "ACHAT" if bullish else "VENTE"
     subject = f"{'🟢 Signal ACHAT' if bullish else '🔴 Signal VENTE'} Fibonacci — {pair} {timeframe}"
-    fib = setup["fib"]
+    fib = setup.get("fib") or {}
+    now_text = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
+
+    zone_low = fib.get("zone_low", "")
+    zone_high = fib.get("zone_high", "")
+    entry = trade_plan.get("entry", "") if trade_plan else ""
+    stop = trade_plan.get("stop_loss", "") if trade_plan else ""
+    target = trade_plan.get("take_profit", "") if trade_plan else ""
+    rr_value = trade_plan.get("rr", "") if trade_plan else ""
+
+    def fmt(value):
+        try:
+            return f"{float(value):.5f}"
+        except (TypeError, ValueError):
+            return "N/D"
+
+    plan_text = (
+        f"Entrée indicative : {fmt(entry)}\n"
+        f"Stop-loss : {fmt(stop)}\n"
+        f"Take-profit : {fmt(target)}\n"
+        f"Ratio R/R : {f'1:{float(rr_value):.2f}' if rr_value != '' else 'Plan non disponible (RR minimum ou structure invalide)'}"
+    )
     body = (
         f"Configuration Fibonacci confirmée sur {pair} en {timeframe}.\n"
-        f"Direction : {'haussière' if bullish else 'baissière'}.\n"
-        f"Zone 50–61,8 % : {fib['zone_low']:.5f} à {fib['zone_high']:.5f}.\n"
+        f"Direction : {direction}.\n"
+        f"Zone Fibonacci 50–61,8 % : {fmt(zone_low)} à {fmt(zone_high)}.\n"
+        f"{plan_text}\n"
+        f"Prix observé au signal : {fmt(current_price)}\n"
         f"Dernière chandelle clôturée : {candle_time}.\n\n"
-        "Signal de configuration à valider manuellement; aucun ordre automatique."
+        "Signal indicatif à valider manuellement; aucun ordre automatique."
     )
-    voice_url = VOICE_STRONG_BULL if bullish else VOICE_STRONG_BEAR
+
+    record = {
+        "Heure alerte": now_text,
+        "Heure chandelle": candle_time,
+        "Instrument": pair,
+        "Timeframe": timeframe,
+        "Direction": direction,
+        "Etat": "CONFIRME",
+        "Zone basse": zone_low,
+        "Zone haute": zone_high,
+        "Entree": entry,
+        "Stop-loss": stop,
+        "Take-profit": target,
+        "R_R": rr_value,
+        "Prix au signal": current_price,
+        "Mode Fibonacci": "MANUEL" if fib.get("manual") else "AUTOMATIQUE",
+        "Resultat": "",
+        "Notes": ""
+    }
+    append_alert_history(record)
 
     st.session_state.setdefault("fib_new_alerts", [])
     st.session_state["fib_new_alerts"].append({
-        "Heure": datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"),
-        "Instrument": pair, "Timeframe": timeframe, "Signal": subject
+        "Heure": now_text,
+        "Instrument": pair,
+        "Timeframe": timeframe,
+        "Signal": subject,
+        "Zone": f"{fmt(zone_low)} – {fmt(zone_high)}",
+        "Entrée": fmt(entry),
+        "SL": fmt(stop),
+        "TP": fmt(target),
+        "R/R": f"1:{float(rr_value):.2f}" if rr_value != "" else "N/D"
     })
+
+    voice_url = VOICE_STRONG_BULL if bullish else VOICE_STRONG_BEAR
     if not mute_alerts:
         play_voice_alert(voice_url)
     if email_alerts_enabled:
@@ -631,7 +727,10 @@ for config in instruments_config:
             setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override)
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
 
-        process_fibonacci_alert(pair, timeframe, setup, candle_time)
+        trade_plan, trade_message = build_trade_plan(setup, current_price)
+        process_fibonacci_alert(
+            pair, timeframe, setup, candle_time, current_price, trade_plan
+        )
 
         if current_price is not None:
             st.write(f"💵 Prix actuel OANDA : **{current_price:.5f}**")
@@ -653,7 +752,6 @@ for config in instruments_config:
             st.write(f"**Origine du swing :** {fib['origin']['price']:.5f}  |  **Extrémité :** {fib['endpoint']['price']:.5f}")
 
         st.markdown("#### Plan de trade Fibonacci")
-        trade_plan, trade_message = build_trade_plan(setup, current_price)
         if trade_plan:
             st.success(
                 f"PLAN INDICATIF {trade_plan['side']} — "
@@ -743,7 +841,7 @@ for config in instruments_config:
         st.error(f"Erreur pour {pair} ({timeframe}) : {exc}")
 
 
-# RECENT ALERTS
+# RECENT ALERTS AND DOWNLOADABLE HISTORY
 st.markdown("---")
 st.subheader("🔔 Alertes Fibonacci récentes")
 recent_alerts = st.session_state.get("fib_new_alerts", [])
@@ -752,6 +850,24 @@ if recent_alerts:
 else:
     st.info("Aucune nouvelle alerte Fibonacci depuis l'ouverture du dashboard.")
 
+st.markdown("#### 📚 Journal complet des alertes")
+alert_history = load_alert_history()
+if not alert_history.empty:
+    st.caption(
+        f"{len(alert_history)} alerte(s) enregistrée(s) dans le journal local. "
+        "Les colonnes Résultat et Notes sont prévues pour ton analyse après coup."
+    )
+    st.dataframe(alert_history.iloc[::-1], width="stretch", hide_index=True)
+    csv_data = alert_history.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="⬇️ Télécharger le journal Fibonacci (CSV / Excel)",
+        data=csv_data,
+        file_name=f"journal_fibonacci_{datetime.now(pytz.timezone('America/New_York')).strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+else:
+    st.info("Le journal sera créé automatiquement à la première nouvelle alerte confirmée.")
 
 # PROFIT / LOSS LAST 7 DAYS
 st.markdown("---")
