@@ -38,8 +38,6 @@ if not SUPABASE_URL.startswith(("https://", "http://")):
 
 SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", "")
 
-st.write("Diagnostic URL Supabase :", repr(SUPABASE_URL))
-
 SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", "")
 
 def supabase_configured():
