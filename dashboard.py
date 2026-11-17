@@ -10,6 +10,8 @@ import oandapyV20.endpoints.instruments as instruments
 from oandapyV20.endpoints.transactions import TransactionList
 from streamlit_autorefresh import st_autorefresh
 import smtplib
+import requests
+import hashlib
 from pathlib import Path
 from email.mime.text import MIMEText
 
@@ -22,6 +24,153 @@ def get_secret(name, default=None):
         return st.secrets.get(name, default)
     except Exception:
         return default
+
+
+# SUPABASE — stockage persistant des trades virtuels
+SUPABASE_URL = str(get_secret("SUPABASE_URL", "") or "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", "")
+
+def supabase_configured():
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+def supabase_request(method, table="virtual_trades", params=None, payload=None,
+                     prefer=None):
+    """Appel REST Supabase. La clé service_role reste côté serveur Streamlit."""
+    if not supabase_configured():
+        raise RuntimeError("Secrets SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY manquants.")
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    response = requests.request(
+        method,
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=headers,
+        params=params,
+        json=payload,
+        timeout=20,
+    )
+    response.raise_for_status()
+    if response.text.strip():
+        return response.json()
+    return []
+
+def create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mode):
+    """Enregistre un signal confirmé avec plan valide une seule fois."""
+    if not trade_plan or not setup.get("fib"):
+        return False, "Aucun plan complet à enregistrer."
+    fib = setup["fib"]
+    direction = fib["direction"]
+    candle_iso = pd.Timestamp(
+        candle_time.replace(" NY", "")
+    ).tz_localize("America/New_York").isoformat()
+    fib_identity = (
+        f"{pair}|{timeframe}|{direction}|{candle_iso}|{fib_mode}|"
+        f"{fib['origin']['time']}|{fib['endpoint']['time']}"
+    )
+    signal_key = hashlib.sha256(fib_identity.encode("utf-8")).hexdigest()
+    payload = {
+        "signal_key": signal_key,
+        "instrument": pair,
+        "timeframe": timeframe,
+        "direction": direction,
+        "fib_mode": fib_mode.upper(),
+        "signal_time": datetime.now(pytz.UTC).isoformat(),
+        "candle_time": candle_iso,
+        "entry_price": float(trade_plan["entry"]),
+        "stop_loss": float(trade_plan["stop_loss"]),
+        "take_profit": float(trade_plan["take_profit"]),
+        "rr": float(trade_plan["rr"]),
+        "status": "OPEN",
+        "notes": "Trade virtuel créé au prix indicatif du signal; aucun ordre OANDA envoyé.",
+    }
+    result = supabase_request(
+        "POST", payload=payload,
+        params={"on_conflict": "signal_key"},
+        prefer="resolution=ignore-duplicates,return=representation",
+    )
+    return bool(result), "Trade virtuel enregistré." if result else "Signal déjà enregistré."
+
+def monitor_virtual_trades(pair, timeframe, closed_df):
+    """Vérifie les chandelles clôturées après le signal et ferme les trades virtuels."""
+    if not supabase_configured() or closed_df.empty:
+        return
+    trades = supabase_request(
+        "GET",
+        params={
+            "select": "*",
+            "status": "eq.OPEN",
+            "instrument": f"eq.{pair}",
+            "timeframe": f"eq.{timeframe}",
+            "order": "candle_time.asc",
+        },
+    )
+    if not trades:
+        return
+
+    candles = closed_df.copy()
+    candles["_utc_time"] = pd.to_datetime(candles["time"], utc=True)
+    for trade in trades:
+        signal_candle_time = pd.to_datetime(trade["candle_time"], utc=True)
+        later = candles[candles["_utc_time"] > signal_candle_time]
+        for _, candle in later.iterrows():
+            high = float(candle["high"])
+            low = float(candle["low"])
+            direction = trade["direction"]
+            stop = float(trade["stop_loss"])
+            target = float(trade["take_profit"])
+
+            if direction == "BULL":
+                hit_stop = low <= stop
+                hit_target = high >= target
+            else:
+                hit_stop = high >= stop
+                hit_target = low <= target
+
+            if not hit_stop and not hit_target:
+                continue
+
+            close_time = pd.Timestamp(candle["time"]).isoformat()
+            if hit_stop and hit_target:
+                status = "AMBIGUOUS"
+                close_price = None
+                result_r = None
+                note = "TP et SL touchés dans la même chandelle; ordre intrachandelle inconnu."
+            elif hit_target:
+                status = "WIN"
+                close_price = target
+                result_r = float(trade["rr"])
+                note = "Take-profit atteint."
+            else:
+                status = "LOSS"
+                close_price = stop
+                result_r = -1.0
+                note = "Stop-loss atteint."
+
+            supabase_request(
+                "PATCH",
+                params={"id": f"eq.{trade['id']}", "status": "eq.OPEN"},
+                payload={
+                    "status": status,
+                    "close_price": close_price,
+                    "close_time": close_time,
+                    "result_r": result_r,
+                    "notes": note,
+                    "updated_at": datetime.now(pytz.UTC).isoformat(),
+                },
+                prefer="return=minimal",
+            )
+            break
+
+def load_virtual_trade_stats():
+    """Charge l'historique des trades virtuels depuis Supabase."""
+    return supabase_request(
+        "GET",
+        params={"select": "*", "order": "created_at.desc", "limit": "500"},
+    )
 
 
 ACCESS_TOKEN = get_secret("OANDA_ACCESS_TOKEN")
@@ -603,6 +752,17 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
     }
     append_alert_history(record)
 
+    if supabase_configured():
+        try:
+            create_virtual_trade(
+                pair, timeframe, setup, candle_time, trade_plan,
+                "MANUEL" if fib.get("manual") else "AUTOMATIQUE"
+            )
+        except Exception as exc:
+            st.warning(f"Erreur Supabase — enregistrement du trade virtuel : {exc}")
+    else:
+        st.warning("Supabase non configuré : vérifie SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY.")
+
     st.session_state.setdefault("fib_new_alerts", [])
     st.session_state["fib_new_alerts"].append({
         "Heure": now_text,
@@ -650,6 +810,12 @@ for config in instruments_config:
         if closed_df.empty:
             st.warning(f"Aucune chandelle clôturée disponible pour {pair}.")
             continue
+
+        if supabase_configured():
+            try:
+                monitor_virtual_trades(pair, timeframe, closed_df)
+            except Exception as exc:
+                st.warning(f"Erreur Supabase — suivi des trades virtuels ({pair}) : {exc}")
 
         df = add_indicators(closed_df)
         # Utilise la dernière chandelle reçue (potentiellement en formation) comme prix courant.
@@ -839,6 +1005,56 @@ for config in instruments_config:
 
     except Exception as exc:
         st.error(f"Erreur pour {pair} ({timeframe}) : {exc}")
+
+
+# SUIVI DES TRADES VIRTUELS SUPABASE
+st.markdown("---")
+st.subheader("📊 Suivi des trades virtuels Fibonacci")
+if not supabase_configured():
+    st.warning("Connexion Supabase non disponible. Vérifie les deux secrets dans Streamlit.")
+else:
+    try:
+        virtual_trades = load_virtual_trade_stats()
+        virtual_df = pd.DataFrame(virtual_trades)
+        if virtual_df.empty:
+            st.info("Aucun trade virtuel enregistré pour le moment.")
+        else:
+            counts = virtual_df["status"].value_counts()
+            opened = int(counts.get("OPEN", 0))
+            wins = int(counts.get("WIN", 0))
+            losses = int(counts.get("LOSS", 0))
+            ambiguous = int(counts.get("AMBIGUOUS", 0))
+            expired = int(counts.get("EXPIRED", 0))
+            completed = wins + losses
+            win_rate = (wins / completed * 100) if completed else 0.0
+
+            stat_cols = st.columns(5)
+            stat_cols[0].metric("Trades ouverts", opened)
+            stat_cols[1].metric("Gagnants", wins)
+            stat_cols[2].metric("Perdants", losses)
+            stat_cols[3].metric("Taux de réussite", f"{win_rate:.1f}%" if completed else "N/D")
+            stat_cols[4].metric("Ambigus / expirés", f"{ambiguous} / {expired}")
+
+            display_columns = [
+                "created_at", "instrument", "timeframe", "direction", "fib_mode",
+                "entry_price", "stop_loss", "take_profit", "rr", "status",
+                "close_price", "close_time", "result_r", "notes"
+            ]
+            available_columns = [c for c in display_columns if c in virtual_df.columns]
+            st.dataframe(
+                virtual_df[available_columns],
+                width="stretch",
+                hide_index=True,
+            )
+            st.download_button(
+                "⬇️ Télécharger l'historique des trades virtuels (CSV)",
+                data=virtual_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"trades_virtuels_{datetime.now(pytz.timezone('America/New_York')).strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+    except Exception as exc:
+        st.error(f"Impossible de charger les trades virtuels depuis Supabase : {exc}")
 
 
 # RECENT ALERTS AND DOWNLOADABLE HISTORY
