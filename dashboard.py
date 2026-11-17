@@ -27,7 +27,10 @@ def get_secret(name, default=None):
 
 
 # SUPABASE — stockage persistant des trades virtuels
-SUPABASE_URL = str(get_secret("SUPABASE_URL", "") or "").rstrip("/")
+SUPABASE_URL = str(get_secret("SUPABASE_URL", "") or "").strip().strip('"').rstrip("/")
+
+if SUPABASE_URL and not SUPABASE_URL.startswith(("https://", "http://")):
+    SUPABASE_URL = "https://" + SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", "")
 
 def supabase_configured():
