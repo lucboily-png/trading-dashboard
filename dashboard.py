@@ -34,6 +34,9 @@ SUPABASE_URL = SUPABASE_URL.replace("http://https://", "https://")
 
 if SUPABASE_URL and not SUPABASE_URL.startswith(("https://", "http://")):
     SUPABASE_URL = "https://" + SUPABASE_URL
+
+st.write("Diagnostic URL Supabase :", repr(SUPABASE_URL))
+
 SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", "")
 
 def supabase_configured():
