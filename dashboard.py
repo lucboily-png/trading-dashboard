@@ -973,9 +973,9 @@ for config in instruments_config:
         )
 
         # Affichage du prix actuel avec une ligne horizontale
-live_time = None
+        live_time = None
 
-if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
+    if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
     live_time = pd.to_datetime(raw_df.iloc[-1]["time"], utc=True)
     live_price = float(raw_df.iloc[-1]["close"])
 
