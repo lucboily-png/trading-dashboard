@@ -38,8 +38,6 @@ if not SUPABASE_URL.startswith(("https://", "http://")):
 
 SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", "")
 
-SUPABASE_SERVICE_ROLE_KEY = get_secret("SUPABASE_SERVICE_ROLE_KEY", "")
-
 def supabase_configured():
     return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
@@ -78,7 +76,7 @@ def create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mo
         candle_time.replace(" NY", "")
     ).tz_localize("America/New_York").isoformat()
     fib_identity = (
-        f"{pair}|{timeframe}|{direction}|{candle_iso}|{fib_mode}|"
+        f"{pair}|{timeframe}|{direction}|{fib_mode}|"
         f"{fib['origin']['time']}|{fib['endpoint']['time']}"
     )
     signal_key = hashlib.sha256(fib_identity.encode("utf-8")).hexdigest()
@@ -696,29 +694,42 @@ def load_alert_history():
 
 
 def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, trade_plan):
-    state_key = f"fib_alert_state_{pair}_{timeframe}"
-    previous_state = st.session_state.get(state_key, "INIT")
-    st.session_state[state_key] = setup["state"]
+    """Envoie une alerte seulement si la confirmation possède un plan complet."""
+    if setup.get("state") not in ("BULL_CONFIRMED", "BEAR_CONFIRMED"):
+        return
+    if not trade_plan:
+        # Ne pas envoyer de courriel avec Entrée/SL/TP à N/D.
+        # Le signal pourra être évalué de nouveau au prochain rafraîchissement.
+        return
 
-    is_new_signal = (
-        setup["state"] in ("BULL_CONFIRMED", "BEAR_CONFIRMED")
-        and setup["state"] != previous_state
-    )
-    if not is_new_signal:
+    fib = setup.get("fib")
+    if not fib:
         return
 
     bullish = setup["state"] == "BULL_CONFIRMED"
     direction = "ACHAT" if bullish else "VENTE"
+    fib_mode = "MANUEL" if fib.get("manual") else "AUTOMATIQUE"
+
+    # Une seule alerte par swing Fibonacci, même si Streamlit redémarre ou
+    # si l'état oscille pendant plusieurs rafraîchissements.
+    signal_identity = (
+        f"{pair}|{timeframe}|{fib['direction']}|{fib_mode}|"
+        f"{fib['origin']['time']}|{fib['endpoint']['time']}"
+    )
+    signal_key = hashlib.sha256(signal_identity.encode("utf-8")).hexdigest()
+    alert_state_key = f"fib_alerted_setup_{pair}_{timeframe}"
+    if st.session_state.get(alert_state_key) == signal_key:
+        return
+
     subject = f"{'🟢 Signal ACHAT' if bullish else '🔴 Signal VENTE'} Fibonacci — {pair} {timeframe}"
-    fib = setup.get("fib") or {}
     now_text = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
 
     zone_low = fib.get("zone_low", "")
     zone_high = fib.get("zone_high", "")
-    entry = trade_plan.get("entry", "") if trade_plan else ""
-    stop = trade_plan.get("stop_loss", "") if trade_plan else ""
-    target = trade_plan.get("take_profit", "") if trade_plan else ""
-    rr_value = trade_plan.get("rr", "") if trade_plan else ""
+    entry = float(trade_plan["entry"])
+    stop = float(trade_plan["stop_loss"])
+    target = float(trade_plan["take_profit"])
+    rr_value = float(trade_plan["rr"])
 
     def fmt(value):
         try:
@@ -730,7 +741,7 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
         f"Entrée indicative : {fmt(entry)}\n"
         f"Stop-loss : {fmt(stop)}\n"
         f"Take-profit : {fmt(target)}\n"
-        f"Ratio R/R : {f'1:{float(rr_value):.2f}' if rr_value != '' else 'Plan non disponible (RR minimum ou structure invalide)'}"
+        f"Ratio R/R : 1:{rr_value:.2f}"
     )
     body = (
         f"Configuration Fibonacci confirmée sur {pair} en {timeframe}.\n"
@@ -756,30 +767,32 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
         "Take-profit": target,
         "R_R": rr_value,
         "Prix au signal": current_price,
-        "Mode Fibonacci": "MANUEL" if fib.get("manual") else "AUTOMATIQUE",
+        "Mode Fibonacci": fib_mode,
         "Resultat": "",
-        "Notes": ""
+        "Notes": "Plan complet validé; aucun ordre OANDA envoyé."
     }
-    append_alert_history(record)
 
+    # Enregistre d'abord le trade virtuel : une erreur Supabase ne doit pas
+    # produire une alerte qui semble suivie alors qu'aucun trade n'est stocké.
     if supabase_configured():
         try:
             saved, message = create_virtual_trade(
-                pair, timeframe, setup, candle_time, trade_plan,
-                "MANUEL" if fib.get("manual") else "AUTOMATIQUE"
+                pair, timeframe, setup, candle_time, trade_plan, fib_mode
             )
-
-            if saved:
-                st.success(f"Supabase : {message}")
-            else:
-                st.warning(f"Supabase : {message}")
-
         except Exception as exc:
             st.error(f"Erreur Supabase — enregistrement : {exc}")
+            return
+
+        if not saved:
+            # Le signal existe déjà dans Supabase : ne pas renvoyer le même courriel.
+            st.info(f"Supabase : {message}")
+            st.session_state[alert_state_key] = signal_key
+            return
+        st.success(f"Supabase : {message}")
     else:
-        st.error("Supabase non configuré : vérifie les Secrets.")
+        st.warning("Supabase non configuré : le trade virtuel ne sera pas enregistré.")
 
-
+    append_alert_history(record)
 
     st.session_state.setdefault("fib_new_alerts", [])
     st.session_state["fib_new_alerts"].append({
@@ -791,7 +804,7 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
         "Entrée": fmt(entry),
         "SL": fmt(stop),
         "TP": fmt(target),
-        "R/R": f"1:{float(rr_value):.2f}" if rr_value != "" else "N/D"
+        "R/R": f"1:{rr_value:.2f}"
     })
 
     voice_url = VOICE_STRONG_BULL if bullish else VOICE_STRONG_BEAR
@@ -801,6 +814,9 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
         sent, status = send_email_alert(subject, body)
         if not sent and "non configurés" not in status:
             st.warning(status)
+
+    # Empêche les doublons au prochain rafraîchissement.
+    st.session_state[alert_state_key] = signal_key
 
 
 # MAIN DASHBOARD
@@ -913,9 +929,6 @@ for config in instruments_config:
 
         trade_plan, trade_message = build_trade_plan(setup, current_price)
 
-        st.write("DIAGNOSTIC PLAN :", trade_message)
-        st.write("ÉTAT FIBONACCI :", setup.get("state"))
-        st.write("PRIX UTILISÉ :", current_price)
 
         process_fibonacci_alert(
                 pair, timeframe, setup, candle_time, current_price, trade_plan
@@ -961,12 +974,6 @@ for config in instruments_config:
             st.info(trade_message)
 
         # CHART
-        fig = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.7, 0.3], vertical_spacing=0.05
-        )
-        
-                # CHART
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True,
             row_heights=[0.7, 0.3], vertical_spacing=0.05
