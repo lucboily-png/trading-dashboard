@@ -912,6 +912,11 @@ for config in instruments_config:
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
 
         trade_plan, trade_message = build_trade_plan(setup, current_price)
+
+        st.write("DIAGNOSTIC PLAN :", trade_message)
+st.write("ÉTAT FIBONACCI :", setup.get("state"))
+st.write("PRIX UTILISÉ :", current_price)
+
         process_fibonacci_alert(
             pair, timeframe, setup, candle_time, current_price, trade_plan
         )
