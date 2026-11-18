@@ -961,6 +961,12 @@ for config in instruments_config:
             row_heights=[0.7, 0.3], vertical_spacing=0.05
         )
         
+                # CHART
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.7, 0.3], vertical_spacing=0.05
+        )
+
         # Prix des chandelles clôturées
         fig.add_trace(
             go.Scatter(
@@ -976,21 +982,20 @@ for config in instruments_config:
         live_time = None
 
         if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
-        live_time = pd.to_datetime(raw_df.iloc[-1]["time"], utc=True)
-        live_price = float(raw_df.iloc[-1]["close"])
+            live_time = pd.to_datetime(raw_df.iloc[-1]["time"], utc=True)
+            live_price = float(raw_df.iloc[-1]["close"])
 
-    fig.add_hline(
-        y=live_price,
-        line_dash="dash",
-        line_color="#00C853",
-        line_width=2,
-        annotation_text=f"PRIX ACTUEL : {live_price:.2f}",
-        annotation_position="right",
-        row=1,
-        col=1
-    )
+            fig.add_hline(
+                y=live_price,
+                line_dash="dash",
+                line_color="#00C853",
+                line_width=2,
+                annotation_text=f"PRIX ACTUEL : {live_price:.2f}",
+                annotation_position="right",
+                row=1,
+                col=1
+            )
 
-        
         if show_emas:
             for ema_name, ema_color, ema_dash in [
                 ("EMA50", "blue", "solid"),
