@@ -960,9 +960,38 @@ for config in instruments_config:
             rows=2, cols=1, shared_xaxes=True,
             row_heights=[0.7, 0.3], vertical_spacing=0.05
         )
+        
+        # Prix des chandelles clôturées
         fig.add_trace(
-            go.Scatter(x=df["time"], y=df["close"], name="Close",
-                       line=dict(color="gray", dash="dot")), row=1, col=1
+            go.Scatter(
+                x=df["time"],
+                y=df["close"],
+                name="Close",
+                line=dict(color="gray", dash="dot")
+            ),
+            row=1, col=1
+        )
+
+        # Affichage du dernier prix OANDA, même si la chandelle est en formation
+        live_time = None
+
+        if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
+            live_time = pd.to_datetime(raw_df.iloc[-1]["time"], utc=True)
+            live_price = float(raw_df.iloc[-1]["close"])
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[df["time"].iloc[-1], live_time],
+                    y=[float(df["close"].iloc[-1]), live_price],
+                    mode="lines+markers",
+                    name="Prix en formation",
+                    line=dict(color="#00E676", width=3, dash="dash"),
+                    marker=dict(size=9, color="#00E676"),
+                    hovertemplate="Prix actuel : %{y:.5f}<extra></extra>"
+                ),
+                row=1, col=1
+            )
+
         )
         if show_emas:
             for ema_name, ema_color, ema_dash in [
@@ -977,7 +1006,7 @@ for config in instruments_config:
         if setup.get("fib"):
             fib = setup["fib"]
             x0 = fib["origin"]["time"]
-            x1 = df["time"].iloc[-1]
+            x1 = live_time if live_time is not None else df["time"].iloc[-1]
 
             # Affichage classique : seulement les niveaux 0, 0.5 et 1.
             # Les calculs internes du setup (zone 50–61,8 %, signaux et plans)
