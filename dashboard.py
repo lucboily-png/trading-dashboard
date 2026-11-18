@@ -979,34 +979,31 @@ for config in instruments_config:
             row_heights=[0.7, 0.3], vertical_spacing=0.05
         )
 
-        # Prix des chandelles clôturées
+        # Ligne Close des chandelles clôturées, prolongée jusqu'au prix actuel.
+        # Le dernier point correspond à la chandelle OANDA encore en formation.
+        live_time = None
+        close_x = df["time"].tolist()
+        close_y = df["close"].astype(float).tolist()
+
+        if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
+            live_time = pd.to_datetime(
+                raw_df.iloc[-1]["time"], utc=True
+            ).tz_convert("America/New_York")
+            live_price = float(raw_df.iloc[-1]["close"])
+
+            close_x.append(live_time)
+            close_y.append(live_price)
+
         fig.add_trace(
             go.Scatter(
-                x=df["time"],
-                y=df["close"],
+                x=close_x,
+                y=close_y,
                 name="Close",
-                line=dict(color="gray", dash="dot")
+                line=dict(color="gray", dash="dot", width=2),
+                hovertemplate="Close : %{y:.5f}<extra></extra>"
             ),
             row=1, col=1
         )
-
-        # Affichage du prix actuel avec une ligne horizontale
-        live_time = None
-
-        if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
-            live_time = pd.to_datetime(raw_df.iloc[-1]["time"], utc=True)
-            live_price = float(raw_df.iloc[-1]["close"])
-
-            fig.add_hline(
-                y=live_price,
-                line_dash="dash",
-                line_color="#00C853",
-                line_width=2,
-                annotation_text=f"PRIX ACTUEL : {live_price:.2f}",
-                annotation_position="right",
-                row=1,
-                col=1
-            )
 
         if show_emas:
             for ema_name, ema_color, ema_dash in [
