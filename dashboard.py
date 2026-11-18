@@ -992,7 +992,7 @@ for config in instruments_config:
                 row=1, col=1
             )
 
-        )
+        
         if show_emas:
             for ema_name, ema_color, ema_dash in [
                 ("EMA50", "blue", "solid"),
