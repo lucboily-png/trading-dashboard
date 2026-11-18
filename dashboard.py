@@ -911,7 +911,7 @@ for config in instruments_config:
             setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override)
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
 
-                    trade_plan, trade_message = build_trade_plan(setup, current_price)
+        trade_plan, trade_message = build_trade_plan(setup, current_price)
 
             st.write("DIAGNOSTIC PLAN :", trade_message)
             st.write("ÉTAT FIBONACCI :", setup.get("state"))
