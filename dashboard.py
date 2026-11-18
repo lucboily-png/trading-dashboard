@@ -972,25 +972,23 @@ for config in instruments_config:
             row=1, col=1
         )
 
-        # Affichage du dernier prix OANDA, même si la chandelle est en formation
-        live_time = None
+        # Affichage du prix actuel avec une ligne horizontale
+live_time = None
 
-        if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
-            live_time = pd.to_datetime(raw_df.iloc[-1]["time"], utc=True)
-            live_price = float(raw_df.iloc[-1]["close"])
+if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
+    live_time = pd.to_datetime(raw_df.iloc[-1]["time"], utc=True)
+    live_price = float(raw_df.iloc[-1]["close"])
 
-            fig.add_trace(
-                go.Scatter(
-                    x=[df["time"].iloc[-1], live_time],
-                    y=[float(df["close"].iloc[-1]), live_price],
-                    mode="lines+markers",
-                    name="Prix en formation",
-                    line=dict(color="#00E676", width=3, dash="dash"),
-                    marker=dict(size=9, color="#00E676"),
-                    hovertemplate="Prix actuel : %{y:.5f}<extra></extra>"
-                ),
-                row=1, col=1
-            )
+    fig.add_hline(
+        y=live_price,
+        line_dash="dash",
+        line_color="#00C853",
+        line_width=2,
+        annotation_text=f"PRIX ACTUEL : {live_price:.2f}",
+        annotation_position="right",
+        row=1,
+        col=1
+    )
 
         
         if show_emas:
