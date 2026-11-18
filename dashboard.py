@@ -763,15 +763,21 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
     append_alert_history(record)
 
     if supabase_configured():
-        try:
-            create_virtual_trade(
-                pair, timeframe, setup, candle_time, trade_plan,
-                "MANUEL" if fib.get("manual") else "AUTOMATIQUE"
-            )
-        except Exception as exc:
-            st.warning(f"Erreur Supabase — enregistrement du trade virtuel : {exc}")
-    else:
-        st.warning("Supabase non configuré : vérifie SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY.")
+    try:
+        saved, message = create_virtual_trade(
+            pair, timeframe, setup, candle_time, trade_plan,
+            "MANUEL" if fib.get("manual") else "AUTOMATIQUE"
+        )
+
+        if saved:
+            st.success(f"Supabase : {message}")
+        else:
+            st.warning(f"Supabase : {message}")
+
+    except Exception as exc:
+        st.error(f"Erreur Supabase — enregistrement : {exc}")
+else:
+    st.error("Supabase non configuré : vérifie les Secrets.")
 
     st.session_state.setdefault("fib_new_alerts", [])
     st.session_state["fib_new_alerts"].append({
