@@ -1087,6 +1087,30 @@ else:
             completed = wins + losses
             win_rate = (wins / completed * 100) if completed else 0.0
 
+            # Conversion des résultats en R vers des dollars théoriques.
+            # Le risque utilisé est celui configuré dans la barre latérale.
+            risk_per_trade = risk_amount
+            virtual_df["result_r"] = pd.to_numeric(
+                virtual_df["result_r"], errors="coerce"
+            )
+            closed_mask = virtual_df["status"].isin(["WIN", "LOSS"])
+            virtual_df["pnl_usd"] = 0.0
+            virtual_df.loc[closed_mask, "pnl_usd"] = (
+                virtual_df.loc[closed_mask, "result_r"] * risk_per_trade
+            )
+            # Les trades ouverts, ambigus et expirés ne sont pas inclus au P&L réalisé.
+            virtual_df.loc[~closed_mask, "pnl_usd"] = float("nan")
+
+            closed_df = virtual_df.loc[closed_mask].copy()
+            gross_profit = float(closed_df.loc[closed_df["pnl_usd"] > 0, "pnl_usd"].sum())
+            gross_loss = abs(float(closed_df.loc[closed_df["pnl_usd"] < 0, "pnl_usd"].sum()))
+            net_profit = gross_profit - gross_loss
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else (
+                float("inf") if gross_profit > 0 else 0.0
+            )
+            average_trade = net_profit / completed if completed else 0.0
+            return_pct = (net_profit / capital * 100) if capital > 0 else 0.0
+
             stat_cols = st.columns(5)
             stat_cols[0].metric("Trades ouverts", opened)
             stat_cols[1].metric("Gagnants", wins)
@@ -1094,16 +1118,72 @@ else:
             stat_cols[3].metric("Taux de réussite", f"{win_rate:.1f}%" if completed else "N/D")
             stat_cols[4].metric("Ambigus / expirés", f"{ambiguous} / {expired}")
 
+            st.markdown("#### 💵 Rentabilité simulée")
+            st.caption(
+                f"Calcul basé sur un risque fixe de {risk_per_trade:.2f} $ par trade "
+                f"({risk_percent:.2f} % du capital configuré de {capital:.2f} $). "
+                "Les trades ouverts, ambigus et expirés sont exclus du résultat réalisé."
+            )
+            pnl_cols = st.columns(4)
+            pnl_cols[0].metric("Profit net", f"{net_profit:+,.2f} $")
+            pnl_cols[1].metric("Gains bruts", f"{gross_profit:,.2f} $")
+            pnl_cols[2].metric("Pertes brutes", f"-{gross_loss:,.2f} $")
+            pnl_cols[3].metric("Rendement du capital", f"{return_pct:+.2f} %")
+            extra_cols = st.columns(2)
+            pf_text = f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞"
+            extra_cols[0].metric("Profit factor", pf_text)
+            extra_cols[1].metric("Gain / perte moyen par trade", f"{average_trade:+,.2f} $")
+
+            if completed:
+                equity_df = closed_df.copy()
+                equity_df["_sort_time"] = pd.to_datetime(
+                    equity_df["close_time"], errors="coerce", utc=True
+                )
+                equity_df = equity_df.sort_values("_sort_time")
+                equity_df["capital_simule"] = capital + equity_df["pnl_usd"].cumsum()
+                equity_df["trade_num"] = range(1, len(equity_df) + 1)
+
+                st.markdown("#### 📈 Évolution du capital simulé")
+                fig_equity = go.Figure()
+                fig_equity.add_trace(go.Scatter(
+                    x=equity_df["trade_num"],
+                    y=equity_df["capital_simule"],
+                    mode="lines+markers",
+                    name="Capital simulé",
+                    line=dict(width=3),
+                    hovertemplate="Trade %{x}<br>Capital : %{y:,.2f} $<extra></extra>"
+                ))
+                fig_equity.add_hline(
+                    y=capital, line_dash="dash", line_color="gray",
+                    annotation_text="Capital initial"
+                )
+                fig_equity.update_layout(
+                    height=320, template="plotly_dark",
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    xaxis_title="Nombre de trades clôturés",
+                    yaxis_title="Capital ($)",
+                    showlegend=False
+                )
+                st.plotly_chart(fig_equity, width="stretch")
+
             display_columns = [
                 "created_at", "instrument", "timeframe", "direction", "fib_mode",
                 "entry_price", "stop_loss", "take_profit", "rr", "status",
-                "close_price", "close_time", "result_r", "notes"
+                "close_price", "close_time", "result_r", "pnl_usd", "notes"
             ]
             available_columns = [c for c in display_columns if c in virtual_df.columns]
             st.dataframe(
                 virtual_df[available_columns],
                 width="stretch",
                 hide_index=True,
+                column_config={
+                    "pnl_usd": st.column_config.NumberColumn(
+                        "P&L simulé ($)", format="%.2f $"
+                    ),
+                    "result_r": st.column_config.NumberColumn(
+                        "Résultat (R)", format="%.2f R"
+                    ),
+                }
             )
             st.download_button(
                 "⬇️ Télécharger l'historique des trades virtuels (CSV)",
