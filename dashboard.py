@@ -462,15 +462,16 @@ def evaluate_fibonacci_setup(
     current_price=None,
     fib_override=None,
     max_close_extension_atr=0.50,
-    max_live_extension_atr=0.35
+    max_live_extension_atr=0.35,
+    max_trigger_wait_candles=3
 ):
-    """Détecte un retracement Fibonacci confirmé et écarte les entrées trop tardives.
-
-    Le signal est refusé si la chandelle de confirmation clôture trop loin
-    de la zone, ou si le prix en direct a déjà trop prolongé le mouvement.
-    Les seuils sont exprimés en multiples de l'ATR14 du timeframe sélectionné.
+    """Attend un rejet dans la zone, puis la cassure de son extrême par une
+    chandelle clôturée avant de confirmer le signal.
     """
-    fib, fib_message = (fib_override, 'Fibonacci manuel actif.') if fib_override is not None else find_last_fibonacci(df)
+    fib, fib_message = (
+        (fib_override, "Fibonacci manuel actif.")
+        if fib_override is not None else find_last_fibonacci(df)
+    )
     if fib is None:
         return {
             "state": "WAIT", "label": "⚪ En attente d'un Fibonacci valide",
@@ -487,102 +488,148 @@ def evaluate_fibonacci_setup(
         }
 
     last = data.iloc[-1]
-    previous = data.iloc[-2]
-    live = current_price if current_price is not None else float(last["close"])
-
+    live = float(current_price if current_price is not None else last["close"])
     endpoint_index = int(fib["endpoint"]["index"])
-    touch_start = max(endpoint_index + 1, len(data) - 9)
+    touch_start = max(endpoint_index + 1, len(data) - 10)
     retest_candles = data.iloc[touch_start:]
     touch = any(
         float(row["low"]) <= zone_high and float(row["high"]) >= zone_low
         for _, row in retest_candles.iterrows()
     )
+    in_zone = zone_low <= live <= zone_high
 
     if direction == "BULL":
-        confirmed = (
-            touch and float(last["close"]) > float(last["open"])
-            and float(last["close"]) > float(previous["high"])
-            and float(last["close"]) > zone_high
-        )
-        in_zone = zone_low <= live <= zone_high
-        label = "🟢 ACHAT — REBOND FIBONACCI CONFIRMÉ"
-        wait_label = "🟡 Zone d'achat Fibonacci — attente du rebond"
+        label = "🟢 ACHAT — CASSURE DU REJET CONFIRMÉE"
+        wait_label = "🟡 Zone d'achat Fibonacci — attente du rejet et de la cassure"
         zone_name = "ZONE D'ACHAT"
-        details = "Swing haussier : le prix doit revenir dans la zone 50–61,8 %, puis clôturer à la hausse avec une cassure de la chandelle précédente."
-    else:
-        confirmed = (
-            touch and float(last["close"]) < float(last["open"])
-            and float(last["close"]) < float(previous["low"])
-            and float(last["close"]) < zone_low
+        rejection_condition = lambda row: (
+            float(row["close"]) > float(row["open"])
+            and float(row["close"]) > zone_high
         )
-        in_zone = zone_low <= live <= zone_high
-        label = "🔴 VENTE — REJET FIBONACCI CONFIRMÉ"
-        wait_label = "🟡 Zone de vente Fibonacci — attente du rejet"
+        trigger_broken = lambda row, rejection: (
+            float(row["close"]) > float(rejection["high"])
+        )
+        details = (
+            "Après le retour dans la zone 50–61,8 %, le système attend une "
+            "chandelle de rejet haussière, puis la clôture d'une chandelle "
+            "au-dessus de son plus haut."
+        )
+    else:
+        label = "🔴 VENTE — CASSURE DU REJET CONFIRMÉE"
+        wait_label = "🟡 Zone de vente Fibonacci — attente du rejet et de la cassure"
         zone_name = "ZONE DE VENTE"
-        details = "Swing baissier : le prix doit remonter dans la zone 50–61,8 %, puis clôturer à la baisse avec une cassure de la chandelle précédente."
+        rejection_condition = lambda row: (
+            float(row["close"]) < float(row["open"])
+            and float(row["close"]) < zone_low
+        )
+        trigger_broken = lambda row, rejection: (
+            float(row["close"]) < float(rejection["low"])
+        )
+        details = (
+            "Après le retour dans la zone 50–61,8 %, le système attend une "
+            "chandelle de rejet baissière, puis la clôture d'une chandelle "
+            "sous son plus bas."
+        )
+
+    # Cherche la dernière chandelle de rejet clôturée AVANT la dernière chandelle.
+    # La dernière chandelle doit ensuite casser son extrême dans le bon sens.
+    prior = data.iloc[touch_start:-1]
+    rejection = None
+    rejection_index = None
+    for idx in range(len(prior) - 1, -1, -1):
+        row = prior.iloc[idx]
+        overlaps_zone = (
+            float(row["low"]) <= zone_high and float(row["high"]) >= zone_low
+        )
+        if overlaps_zone and rejection_condition(row):
+            rejection = row
+            rejection_index = touch_start + idx
+            break
+
+    confirmed = False
+    trigger_level = None
+    candles_waited = None
+    if rejection is not None:
+        candles_waited = len(data) - 1 - rejection_index
+        if 1 <= candles_waited <= max_trigger_wait_candles:
+            confirmed = trigger_broken(last, rejection)
+            trigger_level = (
+                float(rejection["high"]) if direction == "BULL"
+                else float(rejection["low"])
+            )
 
     if confirmed:
-        # Distance entre la clôture de confirmation et le bord de la zone.
-        # Une extension trop grande signifie que le mouvement est déjà parti.
         close_price = float(last["close"])
         if direction == "BEAR":
             close_extension = max(0.0, zone_low - close_price)
-            live_extension = max(0.0, close_price - float(live))
+            live_extension = max(0.0, close_price - live)
         else:
             close_extension = max(0.0, close_price - zone_high)
-            live_extension = max(0.0, float(live) - close_price)
+            live_extension = max(0.0, live - close_price)
 
         atr_value = float(fib["atr"])
         close_limit = max_close_extension_atr * atr_value
         live_limit = max_live_extension_atr * atr_value
-
         too_late_reasons = []
         if close_extension > close_limit:
             too_late_reasons.append(
-                f"La chandelle de confirmation a déjà dépassé la zone de "
-                f"{close_extension:.5f} (limite {close_limit:.5f})."
+                f"La clôture de déclenchement est déjà à {close_extension:.5f} "
+                f"de la zone (limite {close_limit:.5f})."
             )
         if live_extension > live_limit:
             too_late_reasons.append(
-                f"Depuis la clôture de confirmation, le prix a prolongé le "
-                f"mouvement de {live_extension:.5f} (limite {live_limit:.5f})."
+                f"Le prix en direct a prolongé le mouvement de {live_extension:.5f} "
+                f"depuis la clôture (limite {live_limit:.5f})."
             )
 
         if too_late_reasons:
             return {
                 "state": direction + "_TOO_LATE",
                 "label": (
-                    "⚠️ VENTE — REJET CONFIRMÉ, ENTRÉE TROP TARDIVE"
+                    "⚠️ VENTE — CASSURE CONFIRMÉE, ENTRÉE TROP TARDIVE"
                     if direction == "BEAR"
-                    else "⚠️ ACHAT — REBOND CONFIRMÉ, ENTRÉE TROP TARDIVE"
+                    else "⚠️ ACHAT — CASSURE CONFIRMÉE, ENTRÉE TROP TARDIVE"
                 ),
                 "color": "orange",
-                "details": "Le signal technique est apparu, mais le prix est "
-                           "déjà trop éloigné pour proposer une entrée prudente. "
-                           + " ".join(too_late_reasons)
-                           + " Attendre un nouveau retracement; ne pas poursuivre le prix.",
+                "details": "La cassure est confirmée, mais le prix est déjà trop "
+                           "éloigné. Attendre un nouveau retracement. "
+                           + " ".join(too_late_reasons),
                 "fib": fib, "zone_name": zone_name, "touch": touch,
-                "in_zone": in_zone, "close_extension": close_extension,
-                "live_extension": live_extension,
-                "close_extension_limit": close_limit,
-                "live_extension_limit": live_limit
+                "in_zone": in_zone, "trigger_level": trigger_level
             }
 
         return {
             "state": direction + "_CONFIRMED", "label": label,
             "color": "green" if direction == "BULL" else "red",
-            "details": details + " Filtre anti-retard validé : le prix reste "
-                       "suffisamment proche de la zone pour étudier une entrée.",
-            "fib": fib, "zone_name": zone_name,
-            "touch": touch, "in_zone": in_zone,
-            "close_extension": close_extension,
-            "live_extension": live_extension,
-            "close_extension_limit": close_limit,
-            "live_extension_limit": live_limit
+            "details": (
+                details + f" Niveau de déclenchement cassé : {trigger_level:.5f}. "
+                "Filtre anti-retard validé."
+            ),
+            "fib": fib, "zone_name": zone_name, "touch": touch,
+            "in_zone": in_zone, "trigger_level": trigger_level,
+            "rejection_time": str(rejection["time"])
+        }
+
+    if rejection is not None and candles_waited is not None:
+        if candles_waited <= max_trigger_wait_candles:
+            extra = (
+                f"Rejet détecté. Attente de la cassure de "
+                f"{trigger_level if trigger_level is not None else (float(rejection['high']) if direction == 'BULL' else float(rejection['low'])):.5f}. "
+                f"Chandelles écoulées : {candles_waited}/{max_trigger_wait_candles}."
+            )
+        else:
+            extra = "Le rejet précédent a expiré sans cassure; attente d'un nouveau rejet. "
+        return {
+            "state": direction + "_WAIT", "label": wait_label,
+            "color": "orange", "details": extra + details, "fib": fib,
+            "zone_name": zone_name, "touch": touch, "in_zone": in_zone
         }
 
     if in_zone or touch:
-        extra = "Le prix actuel est dans la zone. " if in_zone else "La zone a été visitée récemment; la confirmation manque encore. "
+        extra = (
+            "Le prix est dans la zone. " if in_zone
+            else "La zone a été visitée récemment. "
+        )
         return {
             "state": direction + "_WAIT", "label": wait_label,
             "color": "orange", "details": extra + details, "fib": fib,
@@ -823,7 +870,7 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
 st.title("Trading Monitor — Fibonacci Setup Alerts")
 st.caption(
     "Alertes basées sur le dernier swing confirmé, le retracement Fibonacci "
-    "50–61,8 %, une chandelle de confirmation et un filtre anti-entrée tardive "
+    "50–61,8 %, un rejet puis la cassure de son extrême, avec filtre anti-entrée tardive "
     "(extension maximale de 0,50 ATR à la clôture et 0,35 ATR en direct)."
 )
 
