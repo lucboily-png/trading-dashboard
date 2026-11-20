@@ -20,6 +20,30 @@ st.set_page_config(page_title="Trading Monitor - Fibonacci Alerts", layout="wide
 st_autorefresh(interval=60 * 1000, key="refresh")
 
 
+# DESIGN V1 â prÃ©sentation uniquement (aucune rÃ¨gle de trading modifiÃ©e)
+st.markdown("""
+<style>
+:root { --navy:#071426; --panel:#0d2038; --panel2:#102945; --line:#1d4267; --blue:#18a8ff; --cyan:#35d5e8; --green:#20d68a; --red:#ff5b6e; --amber:#ffbf47; }
+.stApp { background: radial-gradient(circle at 12% 0%, #102b4a 0, #071426 42%, #050d19 100%); color:#eaf3ff; }
+[data-testid="stHeader"] { background:rgba(5,13,25,.82); }
+[data-testid="stSidebar"] { background:linear-gradient(180deg,#0b1b30,#071321); border-right:1px solid #173756; }
+[data-testid="stSidebar"] * { color:#dcecff; }
+h1,h2,h3,h4 { color:#f1f7ff !important; letter-spacing:-.025em; }
+[data-testid="stMetric"] { background:linear-gradient(145deg,rgba(16,43,72,.95),rgba(8,24,43,.95)); border:1px solid #1c456c; padding:14px 16px; border-radius:15px; box-shadow:0 8px 24px rgba(0,0,0,.18); }
+[data-testid="stMetricLabel"] { color:#9db8d4 !important; }
+[data-testid="stMetricValue"] { color:#f4f8ff !important; }
+[data-testid="stVerticalBlockBorderWrapper"] { background:linear-gradient(145deg,rgba(13,32,56,.92),rgba(7,20,36,.92)); border:1px solid #1b4267; border-radius:17px; }
+.stButton>button, .stDownloadButton>button { border-radius:10px; border:1px solid #187fbe; background:linear-gradient(100deg,#087cc4,#12a9ed); color:white; font-weight:650; }
+.stButton>button:hover, .stDownloadButton>button:hover { border-color:#5bdcff; color:white; }
+[data-testid="stDataFrame"] { border:1px solid #1b4267; border-radius:12px; overflow:hidden; }
+hr { border-color:#1a3b5c !important; }
+[data-testid="stCaptionContainer"] { color:#91abc7; }
+/* Espacement plus proche d'un terminal de trading */
+.block-container { padding-top:1.4rem; padding-bottom:2rem; max-width:1600px; }
+</style>
+""", unsafe_allow_html=True)
+
+
 def get_secret(name, default=None):
     try:
         return st.secrets.get(name, default)
@@ -1099,12 +1123,37 @@ def process_pending_entries(pair, timeframe, closed_df, current_price):
             st.warning(f"Erreur de suivi du retest {pair} {timeframe} : {exc}")
 
 
-# MAIN DASHBOARD
-st.title("Trading Monitor — Fibonacci Setup Alerts")
+# MAIN DASHBOARD — en-tête visuel uniquement
+now_ny = datetime.now(pytz.timezone("America/New_York"))
+st.markdown(
+    f"""
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:18px;
+      padding:18px 22px;margin:0 0 14px 0;border:1px solid #1b4d78;border-radius:18px;
+      background:linear-gradient(105deg,rgba(10,39,68,.98),rgba(5,17,32,.98));
+      box-shadow:0 12px 30px rgba(0,0,0,.22);">
+      <div>
+        <div style="font-size:27px;font-weight:800;color:#f3f8ff;letter-spacing:-.8px;">
+          <span style="color:#18a8ff;">◆</span> Trading Monitor <span style="color:#22b8ff;">— Smart Money</span>
+        </div>
+        <div style="font-size:13px;color:#9bb9d8;margin-top:4px;letter-spacing:1.2px;">ANALYSE&nbsp;&nbsp; • &nbsp;&nbsp;CONFIRMATION&nbsp;&nbsp; • &nbsp;&nbsp;OPPORTUNITÉ</div>
+      </div>
+      <div style="text-align:right;min-width:170px;">
+        <div style="display:inline-block;padding:7px 13px;border-radius:30px;
+          border:1px solid rgba(32,214,138,.45);background:rgba(32,214,138,.10);
+          color:#45e6a0;font-weight:700;font-size:13px;">● MODE SURVEILLANCE</div>
+        <div style="color:#9bb9d8;font-size:12px;margin-top:7px;">{now_ny.strftime('%d %B %Y — %H:%M:%S')} NY&nbsp; • &nbsp;Actualisation 60 s</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True
+)
+summary = st.columns(4)
+summary[0].metric("INSTRUMENTS SUIVIS", "2", "SPX500 • XAU/USD")
+summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Analyse + exécution")
+summary[2].metric("DONNÉES", "OANDA", "Actualisation automatique")
+summary[3].metric("MODE", "Surveillance", "Aucun ordre automatique")
 st.caption(
     "Alertes basées sur le dernier swing confirmé, le retracement Fibonacci "
-    "50–61,8 %, un rejet puis la cassure de son extrême, avec filtre anti-entrée tardive "
-    "(extension maximale de 0,50 ATR à la clôture et 0,35 ATR en direct). "
+    "50–61,8 %, un rejet puis la cassure de son extrême, avec filtre anti-entrée tardive. "
     "Une deuxième confirmation après retest est exigée avant toute entrée."
 )
 
@@ -1112,7 +1161,7 @@ for config in instruments_config:
     pair = config["pair"]
     timeframe = config["timeframe"]
     st.markdown("---")
-    st.subheader(f"{pair} — {timeframe}")
+    st.markdown(f"### <span style=\"color:#22b8ff;\">●</span> {pair.replace('_USD', '')} <span style=\"color:#8eabc9;font-size:15px;\">— {timeframe}</span>", unsafe_allow_html=True)
 
     try:
         raw_df = get_data(pair, timeframe)
