@@ -27,7 +27,7 @@ st.markdown("""
 .stApp { background: radial-gradient(circle at 12% 0%, #102b4a 0, #071426 42%, #050d19 100%); color:#eaf3ff; }
 [data-testid="stHeader"] { background:rgba(5,13,25,.82); }
 [data-testid="stSidebar"] { background:linear-gradient(180deg,#0b1b30,#071321); border-right:1px solid #173756; }
-[data-testid="stSidebar"] * { color:#4ebbe5; }
+[data-testid="stSidebar"] * { color:#dcecff; }
 h1,h2,h3,h4 { color:#f1f7ff !important; letter-spacing:-.025em; }
 [data-testid="stMetric"] { background:linear-gradient(145deg,rgba(16,43,72,.95),rgba(8,24,43,.95)); border:1px solid #1c456c; padding:14px 16px; border-radius:15px; box-shadow:0 8px 24px rgba(0,0,0,.18); }
 [data-testid="stMetricLabel"] { color:#9db8d4 !important; }
@@ -1382,7 +1382,7 @@ for config in instruments_config:
                 x=close_x,
                 y=close_y,
                 name="Close",
-                line=dict(color="gray", dash="dot", width=2),
+                line=dict(color="#B8C7D9", dash="dot", width=2),
                 hovertemplate="Close : %{y:.5f}<extra></extra>"
             ),
             row=1, col=1
@@ -1390,9 +1390,9 @@ for config in instruments_config:
 
         if show_emas:
             for ema_name, ema_color, ema_dash in [
-                ("EMA50", "blue", "solid"),
-                ("EMA100", "gray", "dash"),
-                ("EMA200", "orange", "solid")
+                ("EMA50", "#35B6FF", "solid"),
+                ("EMA100", "#B8C7D9", "dash"),
+                ("EMA200", "#FFB454", "solid")
             ]:
                 fig.add_trace(
                     go.Scatter(x=df["time"], y=df[ema_name], name=ema_name,
@@ -1407,9 +1407,9 @@ for config in instruments_config:
             # Les calculs internes du setup (zone 50–61,8 %, signaux et plans)
             # restent inchangés.
             visible_levels = [
-                (0.0, float(fib["endpoint"]["price"]), "Fibonacci 0", "#42A5F5", "solid", 2),
-                (0.5, float(fib["levels"][0.5]), "Fibonacci 0.5", "#FFD740", "solid", 3),
-                (1.0, float(fib["origin"]["price"]), "Fibonacci 1", "#00E5FF", "solid", 2),
+                (0.0, float(fib["endpoint"]["price"]), "Fibonacci 0", "#35B6FF", "solid", 2),
+                (0.5, float(fib["levels"][0.5]), "Fibonacci 0.5", "#FFC857", "solid", 3),
+                (1.0, float(fib["origin"]["price"]), "Fibonacci 1", "#42E8D4", "solid", 2),
             ]
 
             for ratio, level, level_name, fib_color, fib_dash, fib_width in visible_levels:
@@ -1434,14 +1434,39 @@ for config in instruments_config:
         fig.add_trace(
             go.Bar(
                 x=df["time"], y=df["volume"], name="Volume",
-                marker_color="rgba(150,150,150,0.6)"
+                marker_color="rgba(53,182,255,0.48)"
             ), row=2, col=1
         )
+        # Palette graphique harmonisée avec le thème bleu nuit du Dashboard.
         fig.update_layout(
-            height=700, template="plotly_dark",
+            height=700,
+            template="plotly_dark",
+            paper_bgcolor="#071426",
+            plot_bgcolor="#091B30",
+            font=dict(family="Inter, Arial, sans-serif", color="#DCE8F5", size=12),
             margin=dict(l=20, r=20, t=55, b=20),
-            legend=dict(orientation="h", y=1.08, x=0),
-            hovermode="x unified"
+            legend=dict(
+                orientation="h", y=1.08, x=0,
+                bgcolor="rgba(7,20,38,0.72)",
+                font=dict(color="#DCE8F5", size=11)
+            ),
+            hovermode="x unified",
+            hoverlabel=dict(
+                bgcolor="#102A45", bordercolor="#247DB5",
+                font=dict(color="#F4F8FC")
+            )
+        )
+        fig.update_xaxes(
+            showgrid=True, gridcolor="rgba(76,115,153,0.20)",
+            zeroline=False, showline=True, linecolor="#29445F",
+            tickfont=dict(color="#AFC2D8"),
+            title_font=dict(color="#AFC2D8")
+        )
+        fig.update_yaxes(
+            showgrid=True, gridcolor="rgba(76,115,153,0.20)",
+            zeroline=False, showline=True, linecolor="#29445F",
+            tickfont=dict(color="#AFC2D8"),
+            title_font=dict(color="#AFC2D8")
         )
         st.plotly_chart(fig, width="stretch")
 
