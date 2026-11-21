@@ -38,6 +38,39 @@ h1,h2,h3,h4 { color:#f1f7ff !important; letter-spacing:-.025em; }
 [data-testid="stDataFrame"] { border:1px solid #1b4267; border-radius:12px; overflow:hidden; }
 hr { border-color:#1a3b5c !important; }
 [data-testid="stCaptionContainer"] { color:#91abc7; }
+/* Menus déroulants : contraste renforcé pour les instruments et timeframes */
+[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+    background-color:#102945 !important;
+    border:1px solid #2873a8 !important;
+    color:#f3f8ff !important;
+}
+[data-testid="stSelectbox"] [data-baseweb="select"] input,
+[data-testid="stSelectbox"] [data-baseweb="select"] span,
+[data-testid="stMultiSelect"] [data-baseweb="select"] input,
+[data-testid="stMultiSelect"] [data-baseweb="select"] span {
+    color:#f3f8ff !important;
+    -webkit-text-fill-color:#f3f8ff !important;
+}
+[data-baseweb="popover"] [role="listbox"],
+[data-baseweb="menu"] {
+    background-color:#0d2038 !important;
+    border:1px solid #2873a8 !important;
+}
+[data-baseweb="popover"] [role="option"],
+[data-baseweb="menu"] [role="option"] {
+    background-color:#0d2038 !important;
+    color:#f3f8ff !important;
+    -webkit-text-fill-color:#f3f8ff !important;
+}
+[data-baseweb="popover"] [role="option"]:hover,
+[data-baseweb="popover"] [aria-selected="true"],
+[data-baseweb="menu"] [role="option"]:hover,
+[data-baseweb="menu"] [aria-selected="true"] {
+    background-color:#155184 !important;
+    color:#ffffff !important;
+    -webkit-text-fill-color:#ffffff !important;
+}
 /* Espacement plus proche d'un terminal de trading */
 .block-container { padding-top:1.4rem; padding-bottom:2rem; max-width:1600px; }
 </style>
