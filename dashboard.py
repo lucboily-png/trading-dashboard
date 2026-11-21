@@ -27,7 +27,7 @@ st.markdown("""
 .stApp { background: radial-gradient(circle at 12% 0%, #102b4a 0, #071426 42%, #050d19 100%); color:#eaf3ff; }
 [data-testid="stHeader"] { background:rgba(5,13,25,.82); }
 [data-testid="stSidebar"] { background:linear-gradient(180deg,#0b1b30,#071321); border-right:1px solid #173756; }
-[data-testid="stSidebar"] * { color:#dcecff; }
+[data-testid="stSidebar"] * { color:#22b8ff; }
 h1,h2,h3,h4 { color:#f1f7ff !important; letter-spacing:-.025em; }
 [data-testid="stMetric"] { background:linear-gradient(145deg,rgba(16,43,72,.95),rgba(8,24,43,.95)); border:1px solid #1c456c; padding:14px 16px; border-radius:15px; box-shadow:0 8px 24px rgba(0,0,0,.18); }
 [data-testid="stMetricLabel"] { color:#9db8d4 !important; }
