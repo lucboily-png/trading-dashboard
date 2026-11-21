@@ -71,6 +71,25 @@ hr { border-color:#1a3b5c !important; }
     color:#ffffff !important;
     -webkit-text-fill-color:#ffffff !important;
 }
+/* Correctif ciblé : texte de la valeur sélectionnée dans le champ fermé */
+[data-testid="stSelectbox"] [data-baseweb="select"] *,
+[data-testid="stMultiSelect"] [data-baseweb="select"] * {
+    color: #f3f8ff !important;
+    -webkit-text-fill-color: #f3f8ff !important;
+    opacity: 1 !important;
+}
+[data-testid="stSelectbox"] [data-baseweb="select"] [class*="singleValue"],
+[data-testid="stSelectbox"] [data-baseweb="select"] [class*="single-value"],
+[data-testid="stSelectbox"] [data-baseweb="select"] [role="combobox"] {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    opacity: 1 !important;
+}
+[data-testid="stSelectbox"] [data-baseweb="select"] svg {
+    fill: #dcecff !important;
+    color: #dcecff !important;
+}
+
 /* Espacement plus proche d'un terminal de trading */
 .block-container { padding-top:1.4rem; padding-bottom:2rem; max-width:1600px; }
 </style>
