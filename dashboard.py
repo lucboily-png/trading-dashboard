@@ -1772,6 +1772,140 @@ else:
                 )
                 st.plotly_chart(fig_equity, width="stretch")
 
+                # GRAPHIQUES COMPLEMENTAIRES — statistiques issues des trades Supabase
+                st.markdown("#### 📊 Répartition des résultats et performance")
+
+                chart_col1, chart_col2 = st.columns(2)
+
+                # 1) Répartition des trades terminés
+                with chart_col1:
+                    outcome_values = {
+                        "Gagnants": wins,
+                        "Perdants": losses,
+                        "Ambigus": ambiguous,
+                        "Expirés": expired,
+                    }
+                    outcome_values = {
+                        label: value for label, value in outcome_values.items()
+                        if value > 0
+                    }
+                    if outcome_values:
+                        fig_outcomes = go.Figure(data=[go.Pie(
+                            labels=list(outcome_values.keys()),
+                            values=list(outcome_values.values()),
+                            hole=0.62,
+                            sort=False,
+                            textinfo="label+percent",
+                            marker=dict(
+                                colors=["#20d68a", "#ff5b6e", "#ffbf47", "#8294aa"],
+                                line=dict(color="#071426", width=2),
+                            ),
+                            hovertemplate="%{label}<br>%{value} trade(s)<br>%{percent}<extra></extra>",
+                        )])
+                        fig_outcomes.update_layout(
+                            title="Répartition des trades",
+                            height=340,
+                            template="plotly_dark",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            margin=dict(l=15, r=15, t=55, b=15),
+                            showlegend=False,
+                        )
+                        st.plotly_chart(fig_outcomes, width="stretch")
+                    else:
+                        st.info("Aucun résultat terminé à répartir pour le moment.")
+
+                # 2) Résultat net par instrument, exprimé en R
+                with chart_col2:
+                    if not closed_df.empty and "instrument" in closed_df.columns:
+                        by_instrument = (
+                            closed_df.groupby("instrument", dropna=False)["result_r"]
+                            .sum()
+                            .sort_values()
+                            .reset_index()
+                        )
+                        by_instrument = by_instrument.dropna(subset=["result_r"])
+                        if not by_instrument.empty:
+                            fig_instruments = go.Figure(go.Bar(
+                                x=by_instrument["instrument"].astype(str),
+                                y=by_instrument["result_r"],
+                                marker=dict(
+                                    color=[
+                                        "#20d68a" if value >= 0 else "#ff5b6e"
+                                        for value in by_instrument["result_r"]
+                                    ]
+                                ),
+                                text=[f"{value:+.2f} R" for value in by_instrument["result_r"]],
+                                textposition="outside",
+                                hovertemplate="%{x}<br>Résultat : %{y:+.2f} R<extra></extra>",
+                            ))
+                            fig_instruments.update_layout(
+                                title="Performance par instrument",
+                                height=340,
+                                template="plotly_dark",
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                plot_bgcolor="rgba(0,0,0,0)",
+                                margin=dict(l=15, r=15, t=55, b=35),
+                                yaxis_title="Résultat net (R)",
+                                xaxis_title="",
+                                showlegend=False,
+                                yaxis=dict(zeroline=True, zerolinecolor="#7890aa"),
+                            )
+                            st.plotly_chart(fig_instruments, width="stretch")
+                        else:
+                            st.info("Pas encore assez de résultats par instrument.")
+                    else:
+                        st.info("Les résultats par instrument apparaîtront après les premiers trades clôturés.")
+
+                # 3) Résultat hebdomadaire en R
+                if not closed_df.empty and "close_time" in closed_df.columns:
+                    weekly_df = closed_df.copy()
+                    weekly_df["_close_date"] = pd.to_datetime(
+                        weekly_df["close_time"], errors="coerce", utc=True
+                    )
+                    weekly_df["result_r"] = pd.to_numeric(
+                        weekly_df["result_r"], errors="coerce"
+                    )
+                    weekly_df = weekly_df.dropna(subset=["_close_date", "result_r"])
+                    if not weekly_df.empty:
+                        weekly_df["_week"] = (
+                            weekly_df["_close_date"]
+                            .dt.tz_convert("America/New_York")
+                            .dt.to_period("W")
+                            .astype(str)
+                        )
+                        weekly_results = (
+                            weekly_df.groupby("_week")["result_r"]
+                            .sum()
+                            .reset_index()
+                        )
+                        fig_weekly = go.Figure(go.Bar(
+                            x=weekly_results["_week"],
+                            y=weekly_results["result_r"],
+                            marker=dict(
+                                color=[
+                                    "#20d68a" if value >= 0 else "#ff5b6e"
+                                    for value in weekly_results["result_r"]
+                                ]
+                            ),
+                            text=[f"{value:+.2f} R" for value in weekly_results["result_r"]],
+                            textposition="outside",
+                            hovertemplate="Semaine %{x}<br>Résultat : %{y:+.2f} R<extra></extra>",
+                        ))
+                        fig_weekly.update_layout(
+                            title="Résultat par semaine",
+                            height=320,
+                            template="plotly_dark",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            margin=dict(l=20, r=20, t=55, b=45),
+                            xaxis_title="Semaine de clôture (heure de New York)",
+                            yaxis_title="Résultat net (R)",
+                            showlegend=False,
+                            yaxis=dict(zeroline=True, zerolinecolor="#7890aa"),
+                        )
+                        st.plotly_chart(fig_weekly, width="stretch")
+
             display_columns = [
                 "created_at", "instrument", "timeframe", "direction", "fib_mode",
                 "entry_price", "stop_loss", "take_profit", "rr", "status",
