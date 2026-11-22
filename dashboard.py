@@ -402,29 +402,51 @@ def send_email_alert(subject, body):
 
 # SIDEBAR
 st.sidebar.title("Configuration des instruments")
-pairs = ["SPX500_USD", "XAU_USD", "BTC_USD", "EUR_USD"]
+# Les symboles sont ceux utilisés par OANDA. La disponibilité de BTC_USD
+# dépend du type de compte et des instruments autorisés chez OANDA.
+pairs = [None, "SPX500_USD", "XAU_USD", "EUR_USD", "BTC_USD"]
+pair_labels = {
+    "SPX500_USD": "SPX500 — S&P 500",
+    "XAU_USD": "XAU/USD — Or",
+    "EUR_USD": "EUR/USD — Euro / Dollar",
+    "BTC_USD": "BTC/USD — Bitcoin",
+}
 timeframes = ["M1", "M5", "M15", "M30", "H1", "H4", "D", "W"]
+# Huit emplacements permettent de surveiller quatre marchés en M30 et M5.
+default_configs = [
+    ("SPX500_USD", "M30"), ("SPX500_USD", "M5"),
+    ("XAU_USD", "M30"), ("XAU_USD", "M5"),
+    ("EUR_USD", "M30"), ("EUR_USD", "M5"),
+    (None, "M30"), (None, "M5"),
+]
 instruments_config = []
 
-for i in range(4):
-    # Ordre par défaut : SPX M30, SPX M5, XAU M30, XAU M5.
-    default_pair_index = 0 if i < 2 else 1
-    default_timeframe_index = 3 if i in (0, 2) else 1
+for i, (default_pair, default_timeframe) in enumerate(default_configs):
+    default_pair_index = pairs.index(default_pair)
+    default_timeframe_index = timeframes.index(default_timeframe)
     pair_key = f"pair_{i}"
     timeframe_key = f"timeframe_{i}"
     if st.session_state.get(pair_key) not in pairs:
-        st.session_state[pair_key] = pairs[default_pair_index]
+        st.session_state[pair_key] = default_pair
     if st.session_state.get(timeframe_key) not in timeframes:
-        st.session_state[timeframe_key] = timeframes[default_timeframe_index]
+        st.session_state[timeframe_key] = default_timeframe
     pair = st.sidebar.selectbox(
         f"Instrument {i + 1}", pairs,
-        index=default_pair_index, key=pair_key
+        index=default_pair_index,
+        format_func=lambda value: "— Désactivé —" if value is None else pair_labels.get(value, value),
+        key=pair_key
     )
     timeframe = st.sidebar.selectbox(
         f"Timeframe {i + 1}", timeframes,
         index=default_timeframe_index, key=timeframe_key
     )
-    instruments_config.append({"pair": pair, "timeframe": timeframe})
+    if pair is not None:
+        instruments_config.append({"pair": pair, "timeframe": timeframe})
+
+st.sidebar.caption(
+    "SPX500, XAU/USD et EUR/USD sont préchargés en M30/M5. "
+    "Les deux emplacements libres peuvent servir à ajouter BTC/USD ou un autre timeframe."
+)
 
 mute_alerts = st.sidebar.checkbox("Désactiver les alertes vocales", value=False)
 email_alerts_enabled = st.sidebar.checkbox("Activer les alertes par courriel", value=True)
@@ -1258,7 +1280,11 @@ st.markdown(
     """, unsafe_allow_html=True
 )
 summary = st.columns(4)
-summary[0].metric("INSTRUMENTS SUIVIS", "2", "SPX500 • XAU/USD")
+selected_pairs = list(dict.fromkeys(config["pair"] for config in instruments_config))
+summary[0].metric(
+    "INSTRUMENTS SUIVIS", str(len(selected_pairs)),
+    " • ".join(pair_labels.get(pair, pair) for pair in selected_pairs)
+)
 summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Analyse + exécution")
 summary[2].metric("DONNÉES", "OANDA", "Actualisation automatique")
 summary[3].metric("MODE", "Surveillance", "Aucun ordre automatique")
@@ -1272,7 +1298,7 @@ for config in instruments_config:
     pair = config["pair"]
     timeframe = config["timeframe"]
     st.markdown("---")
-    st.markdown(f"### <span style=\"color:#22b8ff;\">●</span> {pair.replace('_USD', '')} <span style=\"color:#8eabc9;font-size:15px;\">— {timeframe}</span>", unsafe_allow_html=True)
+    st.markdown(f"### <span style=\"color:#22b8ff;\">●</span> {pair_labels.get(pair, pair)} <span style=\"color:#8eabc9;font-size:15px;\">— {timeframe}</span>", unsafe_allow_html=True)
 
     try:
         raw_df = get_data(pair, timeframe)
@@ -1393,7 +1419,14 @@ for config in instruments_config:
         process_pending_entries(pair, timeframe, closed_df, current_price, m30_context)
 
         if current_price is not None:
-            st.write(f"💵 Prix actuel OANDA : **{current_price:.5f}**")
+            # Affichage plus lisible selon la précision habituelle de l'instrument.
+            price_decimals = 2 if ("BTC" in pair.upper() or "XAU" in pair.upper() or "SPX" in pair.upper()) else 5
+            formatted_price = f"{current_price:,.{price_decimals}f}"
+            st.metric(
+                label="💵 PRIX ACTUEL — OANDA",
+                value=formatted_price,
+                help="Dernier prix disponible fourni par OANDA."
+            )
 
         st.markdown(
             f"<h4 style='color:{setup['color']};'>{setup['label']}</h4>",
