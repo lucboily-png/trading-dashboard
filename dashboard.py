@@ -1724,21 +1724,124 @@ else:
             stat_cols[4].metric("Taux de réussite", f"{win_rate:.1f}%" if completed else "N/D")
             stat_cols[5].metric("Ambigus / expirés", f"{ambiguous} / {expired}")
 
-            st.markdown("#### 💵 Rentabilité simulée")
-            st.caption(
-                f"Calcul basé sur un risque fixe de {risk_per_trade:.2f} $ par trade "
-                f"({risk_percent:.2f} % du capital configuré de {capital:.2f} $). "
-                "Les configurations en attente, trades ouverts, ambigus et expirés sont exclues du résultat réalisé."
+            # Semaine de trading : dimanche 17:00 au vendredi 17:00,
+            # selon l'heure de Québec (America/Toronto).
+            closed_df["_close_local"] = pd.to_datetime(
+                closed_df["close_time"], errors="coerce", utc=True
+            ).dt.tz_convert("America/Toronto")
+            now_local = pd.Timestamp.now(tz="America/Toronto")
+
+            # Repère le dimanche 17:00 le plus récent.
+            days_since_sunday = (now_local.weekday() + 1) % 7
+            week_start = (
+                now_local.normalize()
+                - pd.Timedelta(days=days_since_sunday)
+                + pd.Timedelta(hours=17)
             )
-            pnl_cols = st.columns(4)
-            pnl_cols[0].metric("Profit net", f"{net_profit:+,.2f} $")
-            pnl_cols[1].metric("Gains bruts", f"{gross_profit:,.2f} $")
-            pnl_cols[2].metric("Pertes brutes", f"-{gross_loss:,.2f} $")
-            pnl_cols[3].metric("Rendement du capital", f"{return_pct:+.2f} %")
-            extra_cols = st.columns(2)
-            pf_text = f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞"
-            extra_cols[0].metric("Profit factor", pf_text)
-            extra_cols[1].metric("Gain / perte moyen par trade", f"{average_trade:+,.2f} $")
+            if now_local < week_start:
+                week_start -= pd.Timedelta(days=7)
+
+            # La séance hebdomadaire se termine le vendredi à 17:00.
+            week_end = week_start + pd.Timedelta(days=5)
+            week_df = closed_df.loc[
+                (closed_df["_close_local"] >= week_start)
+                & (closed_df["_close_local"] < week_end)
+            ].copy()
+
+            week_trades = len(week_df)
+            week_wins = int((week_df["status"] == "WIN").sum())
+            week_losses = int((week_df["status"] == "LOSS").sum())
+            week_completed = week_wins + week_losses
+            week_win_rate = (week_wins / week_completed * 100) if week_completed else 0.0
+            week_net_usd = float(week_df["pnl_usd"].sum()) if week_trades else 0.0
+            week_net_r = float(week_df["result_r"].sum()) if week_trades else 0.0
+            week_gross_profit = float(week_df.loc[week_df["pnl_usd"] > 0, "pnl_usd"].sum())
+            week_gross_loss = abs(float(week_df.loc[week_df["pnl_usd"] < 0, "pnl_usd"].sum()))
+            week_pf = (
+                week_gross_profit / week_gross_loss if week_gross_loss > 0
+                else (float("inf") if week_gross_profit > 0 else 0.0)
+            )
+
+            st.markdown("#### 💹 Tableau de performance")
+            st.caption(
+                f"Résultats réalisés uniquement · Risque simulé de {risk_per_trade:.2f} $ par trade "
+                f"({risk_percent:.2f} % du capital configuré de {capital:.2f} $). "
+                "Les trades en attente, ouverts, ambigus et expirés ne sont pas inclus dans le profit net."
+            )
+
+            def performance_panel(title, subtitle, net_usd, net_r, winrate, trade_count,
+                                  wins_count, losses_count, factor, accent):
+                net_color = "#36d399" if net_usd >= 0 else "#ff6b7a"
+                factor_text = f"{factor:.2f}" if factor != float("inf") else "∞"
+                return f"""
+                <div style="
+                    background:linear-gradient(145deg, #17263b 0%, #101b2b 100%);
+                    border:1px solid rgba(148,163,184,.20);
+                    border-top:3px solid {accent};
+                    border-radius:16px;padding:19px 20px 17px;
+                    box-shadow:0 8px 24px rgba(0,0,0,.16);min-height:210px;">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+                    <div>
+                      <div style="font-size:17px;font-weight:750;color:#f3f6fb;">{title}</div>
+                      <div style="font-size:11px;color:#9eafc5;margin-top:3px;">{subtitle}</div>
+                    </div>
+                    <div style="font-size:10px;letter-spacing:1px;text-transform:uppercase;
+                                color:{accent};border:1px solid {accent}55;border-radius:20px;
+                                padding:5px 9px;font-weight:700;">{trade_count} trades</div>
+                  </div>
+                  <div style="margin-top:20px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">
+                    <span style="font-size:32px;line-height:1.1;font-weight:800;color:{net_color};">
+                      {net_usd:+,.2f} $
+                    </span>
+                    <span style="font-size:14px;font-weight:700;color:{net_color};">{net_r:+.2f} R</span>
+                  </div>
+                  <div style="height:1px;background:rgba(148,163,184,.17);margin:17px 0 13px;"></div>
+                  <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">
+                    <div>
+                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Réussite</div>
+                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">{winrate:.1f}%</div>
+                    </div>
+                    <div>
+                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Gagnants / pertes</div>
+                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">
+                        <span style="color:#36d399;">{wins_count}</span>
+                        <span style="color:#718096;"> / </span>
+                        <span style="color:#ff6b7a;">{losses_count}</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Profit factor</div>
+                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">{factor_text}</div>
+                    </div>
+                  </div>
+                </div>
+                """
+
+            cumulative_panel = performance_panel(
+                "Performance cumulative", "Depuis le premier trade clôturé",
+                net_profit, float(closed_df["result_r"].sum()) if completed else 0.0,
+                win_rate, completed, wins, losses, profit_factor, "#69a9ff"
+            )
+            week_label = (
+                f"Du dimanche {week_start.strftime('%d %b à 17 h')} "
+                f"au vendredi {week_end.strftime('%d %b à 17 h %Y')}"
+            )
+            weekly_panel = performance_panel(
+                "Cette semaine", week_label, week_net_usd, week_net_r,
+                week_win_rate, week_completed, week_wins, week_losses, week_pf, "#b69cff"
+            )
+
+            panel_cols = st.columns(2, gap="medium")
+            with panel_cols[0]:
+                st.markdown(cumulative_panel, unsafe_allow_html=True)
+            with panel_cols[1]:
+                st.markdown(weekly_panel, unsafe_allow_html=True)
+
+            st.caption(
+                f"Ensemble de l'historique : gains bruts {gross_profit:,.2f} $ · "
+                f"pertes brutes -{gross_loss:,.2f} $ · rendement du capital {return_pct:+.2f} % · "
+                f"gain/perte moyen {average_trade:+,.2f} $ par trade."
+            )
 
             if completed:
                 equity_df = closed_df.copy()
