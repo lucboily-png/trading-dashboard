@@ -1279,6 +1279,16 @@ st.markdown(
     </div>
     """, unsafe_allow_html=True
 )
+st.markdown("""
+<style>
+/* Contraste renforcé pour les libellés, options et chiffres */
+[data-testid="stMetricLabel"] p { color: #c8d7e8 !important; font-weight: 700 !important; }
+[data-testid="stMetricValue"] { color: #ffffff !important; font-weight: 750 !important; }
+[data-testid="stRadio"] label, [data-testid="stRadio"] p { color: #edf4fb !important; }
+[data-testid="stRadio"] [role="radiogroup"] label { color: #edf4fb !important; }
+</style>
+""", unsafe_allow_html=True)
+
 summary = st.columns(4)
 selected_pairs = list(dict.fromkeys(config["pair"] for config in instruments_config))
 summary[0].metric(
@@ -1298,7 +1308,6 @@ for config in instruments_config:
     pair = config["pair"]
     timeframe = config["timeframe"]
     st.markdown("---")
-    st.markdown(f"### <span style=\"color:#22b8ff;\">●</span> {pair_labels.get(pair, pair)} <span style=\"color:#8eabc9;font-size:15px;\">— {timeframe}</span>", unsafe_allow_html=True)
 
     try:
         raw_df = get_data(pair, timeframe)
@@ -1325,11 +1334,28 @@ for config in instruments_config:
         current_price = float(raw_df.iloc[-1]["close"])
         last = df.iloc[-1]
 
-        fib_mode = st.radio(
-            "Méthode Fibonacci", ["Automatique", "Manuel"],
-            horizontal=True, key=f"fib_mode_{pair}_{timeframe}",
-            help="En mode manuel, choisis les chandelles du sommet et du creux, puis ajuste leurs prix."
-        )
+        # Carte de contrôle regroupant instrument, prix et méthode Fibonacci.
+        with st.container(border=True):
+            st.markdown(
+                f"""<div style="background:#14243a;padding:12px 16px;border-radius:10px;
+                border-left:5px solid #35b6e8;margin-bottom:12px;">
+                <div style="color:#f4f7fb;font-size:20px;font-weight:700;">
+                {pair_labels.get(pair, pair)} <span style="color:#9fc5df;font-size:15px;">— {timeframe}</span>
+                </div><div style="color:#c6d5e4;font-size:12px;margin-top:3px;">SURVEILLANCE DU MARCHÉ</div>
+                </div>""",
+                unsafe_allow_html=True
+            )
+            price_col, mode_col = st.columns([1, 2])
+            with price_col:
+                price_decimals = 2 if ("BTC" in pair.upper() or "XAU" in pair.upper() or "SPX" in pair.upper()) else 5
+                formatted_price = f"{current_price:,.{price_decimals}f}"
+                st.metric(label="PRIX ACTUEL · OANDA", value=formatted_price)
+            with mode_col:
+                fib_mode = st.radio(
+                    "MÉTHODE FIBONACCI", ["Automatique", "Manuel"],
+                    horizontal=True, key=f"fib_mode_{pair}_{timeframe}",
+                    help="En mode manuel, choisis les chandelles du sommet et du creux, puis ajuste leurs prix."
+                )
         fib_override = None
         if fib_mode == "Manuel":
             st.caption(
@@ -1417,16 +1443,6 @@ for config in instruments_config:
             pair, timeframe, setup, candle_time, current_price, trade_plan
         )
         process_pending_entries(pair, timeframe, closed_df, current_price, m30_context)
-
-        if current_price is not None:
-            # Affichage plus lisible selon la précision habituelle de l'instrument.
-            price_decimals = 2 if ("BTC" in pair.upper() or "XAU" in pair.upper() or "SPX" in pair.upper()) else 5
-            formatted_price = f"{current_price:,.{price_decimals}f}"
-            st.metric(
-                label="💵 PRIX ACTUEL — OANDA",
-                value=formatted_price,
-                help="Dernier prix disponible fourni par OANDA."
-            )
 
         st.markdown(
             f"<h4 style='color:{setup['color']};'>{setup['label']}</h4>",
