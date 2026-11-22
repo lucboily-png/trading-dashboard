@@ -1517,7 +1517,7 @@ for config in instruments_config:
                 y=close_y,
                 name="Close",
                 line=dict(color="#B8C7D9", dash="dot", width=2),
-                hovertemplate="Close : %{y:.5f}<extra></extra>"
+                hoverinfo="none"
             ),
             row=1, col=1
         )
@@ -1530,7 +1530,7 @@ for config in instruments_config:
             ]:
                 fig.add_trace(
                     go.Scatter(x=df["time"], y=df[ema_name], name=ema_name,
-                               line=dict(color=ema_color, dash=ema_dash, width=2)), row=1, col=1
+                               line=dict(color=ema_color, dash=ema_dash, width=2), hoverinfo="none"), row=1, col=1
                 )
         if setup.get("fib"):
             fib = setup["fib"]
@@ -1551,7 +1551,7 @@ for config in instruments_config:
                     x=[x0, x1], y=[level, level], mode="lines",
                     name=level_name,
                     line=dict(color=fib_color, width=fib_width, dash=fib_dash),
-                    hovertemplate=f"{level_name}<br>%{{y:.5f}}<extra></extra>"
+                    hoverinfo="none"
                 ), row=1, col=1)
             if fib.get("manual"):
                 fig.add_trace(go.Scatter(
@@ -1562,13 +1562,13 @@ for config in instruments_config:
                     textposition="top center",
                     marker=dict(size=11, color="white", line=dict(color="black", width=2)),
                     name="Ancrages manuels",
-                    hovertemplate="Ancrage<br>%{y:.5f}<extra></extra>"
+                    hoverinfo="none"
                 ), row=1, col=1)
 
         fig.add_trace(
             go.Bar(
                 x=df["time"], y=df["volume"], name="Volume",
-                marker_color="rgba(53,182,255,0.48)"
+                marker_color="rgba(53,182,255,0.48)", hoverinfo="none"
             ), row=2, col=1
         )
         # Palette graphique harmonisée avec le thème bleu nuit du Dashboard.
@@ -1584,7 +1584,7 @@ for config in instruments_config:
                 bgcolor="rgba(7,20,38,0.72)",
                 font=dict(color="#DCE8F5", size=11)
             ),
-            hovermode="x unified",
+            hovermode="x",
             hoverlabel=dict(
                 bgcolor="#102A45", bordercolor="#247DB5",
                 font=dict(color="#F4F8FC")
@@ -1602,7 +1602,70 @@ for config in instruments_config:
             tickfont=dict(color="#AFC2D8"),
             title_font=dict(color="#AFC2D8")
         )
-        st.plotly_chart(fig, width="stretch")
+        # Panneau fixe de lecture : les valeurs suivent la chandelle survolée,
+        # sans afficher l'info-bulle Plotly flottante au milieu du graphique.
+        chart_id = "chart_" + hashlib.md5(f"{pair}_{timeframe}".encode("utf-8")).hexdigest()[:10]
+        chart_html = fig.to_html(
+            full_html=False,
+            include_plotlyjs="cdn",
+            config={"responsive": True, "displaylogo": False},
+            div_id=chart_id
+        )
+        price_decimals = 2 if any(token in pair.upper() for token in ("BTC", "XAU", "SPX")) else 5
+        panel_script = f"""
+        <style>
+          html, body {{ margin:0; padding:0; background:#071426; overflow:hidden; }}
+          .chart-wrap {{ position:relative; width:100%; }}
+          .hover-readout {{ position:absolute; z-index:20; top:66px; left:88px;
+            min-width:205px; max-width:260px; padding:10px 12px;
+            border:1px solid #2873a8; border-radius:9px;
+            background:rgba(7,20,38,.94); color:#edf6ff;
+            box-shadow:0 5px 18px rgba(0,0,0,.28);
+            font:12px Inter,Arial,sans-serif; pointer-events:none; }}
+          .hover-readout .heading {{ color:#70caff; font-weight:700; margin-bottom:6px; }}
+          .hover-readout .row {{ display:flex; justify-content:space-between; gap:16px;
+            padding:2px 0; white-space:nowrap; }}
+          .hover-readout .muted {{ color:#9db8d4; }}
+        </style>
+        <div class="chart-wrap">
+          <div class="hover-readout" id="readout_{chart_id}">
+            <div class="heading">LECTURE DE LA CHANDELLE</div>
+            <div class="muted">Survole une chandelle pour afficher ses valeurs ici.</div>
+          </div>
+          {chart_html}
+        </div>
+        <script>
+        (function() {{
+          const chart = document.getElementById("{chart_id}");
+          const panel = document.getElementById("readout_{chart_id}");
+          if (!chart || !panel || !chart.on) return;
+          const decimals = {price_decimals};
+          const order = ["Close", "EMA50", "EMA100", "EMA200"];
+          const colors = {{"Close":"#B8C7D9", "EMA50":"#35B6FF", "EMA100":"#B8C7D9", "EMA200":"#FFB454"}};
+          chart.on("plotly_hover", function(ev) {{
+            if (!ev || !ev.points || !ev.points.length) return;
+            const values = {{}};
+            let x = ev.points[0].x;
+            ev.points.forEach(function(pt) {{
+              const name = (pt.data && pt.data.name) || "";
+              if (order.includes(name) && Number.isFinite(Number(pt.y))) values[name] = Number(pt.y);
+            }});
+            const date = new Date(x);
+            const dateText = Number.isNaN(date.getTime()) ? String(x) :
+              new Intl.DateTimeFormat("fr-CA", {{timeZone:"America/New_York", dateStyle:"medium", timeStyle:"short"}}).format(date) + " NY";
+            let html = '<div class="heading">' + dateText + '</div>';
+            order.forEach(function(name) {{
+              if (values[name] !== undefined) {{
+                html += '<div class="row"><span style="color:' + colors[name] + '">' + name + '</span><strong>' +
+                  values[name].toLocaleString("en-US", {{minimumFractionDigits:decimals, maximumFractionDigits:decimals}}) + '</strong></div>';
+              }}
+            }});
+            if (Object.keys(values).length) panel.innerHTML = html;
+          }});
+        }})();
+        </script>
+        """
+        components.html(panel_script, height=740, scrolling=False)
 
     except Exception as exc:
         st.error(f"Erreur pour {pair} ({timeframe}) : {exc}")
