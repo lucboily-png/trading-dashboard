@@ -2,12 +2,11 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import streamlit.components.v1 as components
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
-from oandapyV20.endpoints.transactions import TransactionList
 from streamlit_autorefresh import st_autorefresh
 import smtplib
 import requests
@@ -1830,33 +1829,3 @@ if not alert_history.empty:
     )
 else:
     st.info("Le journal sera créé automatiquement à la première nouvelle alerte confirmée.")
-
-# PROFIT / LOSS LAST 7 DAYS
-st.markdown("---")
-st.subheader("📅 Profits / Pertes (7 derniers jours)")
-try:
-    since = (datetime.now(pytz.UTC) - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
-    request = TransactionList(accountID=ACCOUNT_ID, params={"from": since})
-    client.request(request)
-    transactions = request.response.get("transactions", [])
-    pnl = {}
-
-    for transaction in transactions:
-        if transaction.get("type") == "ORDER_FILL" and "pl" in transaction:
-            day = transaction["time"].split("T")[0]
-            pnl[day] = pnl.get(day, 0.0) + float(transaction["pl"])
-
-    if pnl:
-        pnl_df = pd.DataFrame(sorted(pnl.items()), columns=["Date", "P&L"])
-        pnl_df["P&L"] = pnl_df["P&L"].round(2)
-        pnl_df["Status"] = pnl_df["P&L"].apply(
-            lambda value: "🟢 Gain" if value >= 0 else "🔴 Perte"
-        )
-        st.dataframe(pnl_df, width="stretch", hide_index=True)
-    else:
-        st.info("Aucune transaction enregistrée dans les 7 derniers jours.")
-except Exception as exc:
-    st.error(f"Erreur OANDA dans l'historique des transactions : {exc}")
-
-now = datetime.now(pytz.timezone("America/New_York"))
-st.caption(f"🕒 Dernière mise à jour : {now.strftime('%Y-%m-%d %H:%M:%S')} NY")
