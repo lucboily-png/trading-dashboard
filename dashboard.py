@@ -402,7 +402,7 @@ def send_email_alert(subject, body):
 
 # SIDEBAR
 st.sidebar.title("Configuration des instruments")
-pairs = ["SPX500_USD", "XAU_USD"]
+pairs = ["SPX500_USD", "XAU_USD", "BTC_USD", "EUR_USD"]
 timeframes = ["M1", "M5", "M15", "M30", "H1", "H4", "D", "W"]
 instruments_config = []
 
