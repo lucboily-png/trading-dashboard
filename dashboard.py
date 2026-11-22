@@ -473,6 +473,46 @@ def get_data(pair, granularity="M30", count=300):
     return df
 
 
+def get_m30_market_context(pair):
+    """Évalue le biais M30 sur chandelles clôturées uniquement."""
+    raw_m30 = get_data(pair, "M30")
+    if raw_m30.empty:
+        return {"bias": "NEUTRAL", "strength": "Indisponible", "adx": None,
+                "details": "Données M30 indisponibles."}
+
+    closed_m30 = raw_m30[raw_m30["complete"]].copy()
+    if len(closed_m30) < 210:
+        return {"bias": "NEUTRAL", "strength": "Données insuffisantes", "adx": None,
+                "details": "Au moins 210 chandelles M30 clôturées sont nécessaires."}
+
+    m30 = add_indicators(closed_m30)
+    last = m30.iloc[-1]
+    values = [last.get("close"), last.get("EMA50"), last.get("EMA100"),
+              last.get("EMA200"), last.get("+DI14"), last.get("-DI14"),
+              last.get("ADX14")]
+    if any(pd.isna(value) for value in values):
+        return {"bias": "NEUTRAL", "strength": "Indisponible", "adx": None,
+                "details": "Indicateurs M30 incomplets."}
+
+    close = float(last["close"])
+    ema50, ema100, ema200 = (float(last[k]) for k in ("EMA50", "EMA100", "EMA200"))
+    plus_di, minus_di = float(last["+DI14"]), float(last["-DI14"])
+    adx = float(last["ADX14"])
+
+    if close > ema200 and ema50 > ema100 and plus_di > minus_di:
+        bias = "BULL"
+        details = "Prix au-dessus de l'EMA200, EMA50 au-dessus EMA100 et +DI dominant."
+    elif close < ema200 and ema50 < ema100 and minus_di > plus_di:
+        bias = "BEAR"
+        details = "Prix sous l'EMA200, EMA50 sous EMA100 et -DI dominant."
+    else:
+        bias = "NEUTRAL"
+        details = "Les critères de direction M30 ne sont pas suffisamment alignés."
+
+    strength = "Faible" if adx < 15 else ("Modérée" if adx < 25 else "Forte")
+    return {"bias": bias, "strength": strength, "adx": adx, "details": details,
+            "candle_time": str(last["time"])}
+
 
 # INDICATORS
 def add_indicators(df):
@@ -996,13 +1036,24 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
     st.session_state[alert_state_key] = signal_key
 
 
-def process_pending_entries(pair, timeframe, closed_df, current_price):
+def process_pending_entries(pair, timeframe, closed_df, current_price, m30_context=None):
     """Phase 2: attend le retest puis une nouvelle clôture dans le sens du trade."""
     if not supabase_configured() or closed_df.empty:
         return
 
     try:
         pending_setups = load_pending_setups(pair, timeframe)
+        if timeframe == "M5" and pending_setups and (
+            not m30_context or m30_context.get("bias") not in ("BULL", "BEAR")
+        ):
+            for pending in pending_setups:
+                update_pending_setup(
+                    pending["id"], json.loads(pending.get("notes") or "{}"),
+                    status="EXPIRED",
+                    note="Configuration M5 annulée : le contexte directionnel M30 est neutre ou indisponible."
+                )
+            st.info(f"{pair} M5 : configuration en attente annulée — contexte M30 non directionnel.")
+            return
     except Exception as exc:
         st.warning(f"Erreur Supabase — lecture des configurations en attente : {exc}")
         return
@@ -1014,6 +1065,14 @@ def process_pending_entries(pair, timeframe, closed_df, current_price):
                 continue
 
             direction = pending["direction"]
+            if timeframe == "M5" and m30_context.get("bias") != direction:
+                update_pending_setup(
+                    pending["id"], meta, status="EXPIRED",
+                    note=("Configuration M5 annulée : le biais M30 n'est plus aligné "
+                          "avec la direction du setup avant la confirmation.")
+                )
+                st.info(f"{pair} M5 : configuration annulée — biais M30 opposé ou neutre.")
+                continue
             trigger = float(meta["trigger_level"])
             atr = float(meta["atr"])
             tolerance = float(meta.get("retest_tolerance_atr", 0.15)) * atr
@@ -1234,6 +1293,7 @@ for config in instruments_config:
                 st.warning(f"Erreur Supabase — suivi des trades virtuels ({pair}) : {exc}")
 
         df = add_indicators(closed_df)
+        m30_context = get_m30_market_context(pair) if timeframe == "M5" else None
         # Utilise la dernière chandelle reçue (potentiellement en formation) comme prix courant.
         # Cela évite une requête M1 OANDA supplémentaire pour chaque instrument.
         current_price = float(raw_df.iloc[-1]["close"])
@@ -1307,15 +1367,30 @@ for config in instruments_config:
             }
         else:
             setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override)
-        candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
 
+        if (timeframe == "M5" and setup.get("state") in ("BULL_CONFIRMED", "BEAR_CONFIRMED")):
+            required_bias = "BULL" if setup["state"] == "BULL_CONFIRMED" else "BEAR"
+            if not m30_context or m30_context.get("bias") != required_bias:
+                setup = {
+                    **setup,
+                    "state": "M30_FILTERED",
+                    "label": "⚪ CONFIGURATION M5 BLOQUÉE — CONTEXTE M30 NON ALIGNÉ",
+                    "color": "gray",
+                    "details": (
+                        setup.get("details", "") + " Filtre M30 : "
+                        + (m30_context.get("details", "Contexte M30 indisponible.") if m30_context else "Contexte M30 indisponible.")
+                        + " Aucune configuration M5 n'est enregistrée."
+                    )
+                }
+
+        candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
         trade_plan, trade_message = build_trade_plan(setup, current_price)
 
 
         process_fibonacci_alert(
             pair, timeframe, setup, candle_time, current_price, trade_plan
         )
-        process_pending_entries(pair, timeframe, closed_df, current_price)
+        process_pending_entries(pair, timeframe, closed_df, current_price, m30_context)
 
         if current_price is not None:
             st.write(f"💵 Prix actuel OANDA : **{current_price:.5f}**")
@@ -1327,9 +1402,19 @@ for config in instruments_config:
         st.write(setup["details"])
         st.caption(f"Signal calculé sur la dernière chandelle clôturée : {candle_time}")
 
-        col1, col2 = st.columns(2)
-        col1.metric("ADX14", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
-        col2.metric("Fibonacci", "Valide" if setup.get("fib") else "En attente")
+        if timeframe == "M5" and m30_context:
+            context_label = {"BULL": "HAUSSIER", "BEAR": "BAISSIER", "NEUTRAL": "NEUTRE"}.get(m30_context["bias"], "N/D")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("BIAIS M30", context_label)
+            col2.metric("FORCE M30", m30_context.get("strength", "N/D"))
+            col3.metric("ADX M30", "N/D" if m30_context.get("adx") is None else f"{m30_context['adx']:.1f}")
+            col4.metric("ADX M5", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
+            st.caption(m30_context.get("details", ""))
+            st.caption("Filtre actif : une configuration M5 doit être dans le même sens que le biais M30.")
+        else:
+            col1, col2 = st.columns(2)
+            col1.metric("ADX14", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
+            col2.metric("Fibonacci", "Valide" if setup.get("fib") else "En attente")
         if setup.get("fib"):
             fib = setup["fib"]
             zone_name = setup.get("zone_name", "ZONE DE RETRACEMENT")
