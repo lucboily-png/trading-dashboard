@@ -966,6 +966,82 @@ def load_alert_history():
         return pd.DataFrame(columns=ALERT_COLUMNS)
 
 
+def process_early_fibonacci_alert(pair, timeframe, setup, candle_time, current_price,
+                                  closed_df, m30_context=None):
+    """Alerte précoce M5 au premier contact de la zone Fibonacci.
+
+    Cette notification signale une occasion à surveiller, jamais une entrée.
+    Le biais M30 neutre est permis; un biais M30 franchement opposé bloque
+    uniquement cette alerte précoce. La confirmation d'entrée reste inchangée.
+    """
+    if timeframe != "M5" or not setup.get("fib") or closed_df.empty:
+        return
+    if setup.get("state") not in ("BULL_TRACKING", "BEAR_TRACKING",
+                                    "BULL_WAIT", "BEAR_WAIT"):
+        return
+
+    fib = setup["fib"]
+    direction = fib.get("direction")
+    if direction not in ("BULL", "BEAR"):
+        return
+
+    # M30 neutre autorisé pour la surveillance; biais opposé = pas d'alerte.
+    bias = (m30_context or {}).get("bias", "NEUTRAL")
+    if bias in ("BULL", "BEAR") and bias != direction:
+        return
+
+    last = closed_df.iloc[-1]
+    last_candle_touched = (
+        float(last["low"]) <= float(fib["zone_high"])
+        and float(last["high"]) >= float(fib["zone_low"])
+    )
+    live_in_zone = float(fib["zone_low"]) <= float(current_price) <= float(fib["zone_high"])
+    if not (last_candle_touched or live_in_zone):
+        return
+
+    fib_mode = "MANUEL" if fib.get("manual") else "AUTOMATIQUE"
+    signal_key = _signal_identity(pair, timeframe, fib, fib_mode)
+    alert_state_key = f"fib_early_alerted_setup_{pair}_{timeframe}"
+    if st.session_state.get(alert_state_key) == signal_key:
+        return
+
+    direction_label = "ACHAT" if direction == "BULL" else "VENTE"
+    zone_low, zone_high = float(fib["zone_low"]), float(fib["zone_high"])
+    now_text = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
+    subject = f"🔎 Surveillance {direction_label} Fibonacci — {pair} M5"
+    m30_note = (
+        "Biais M30 neutre : surveillance permise, confirmation M30 non acquise."
+        if bias == "NEUTRAL" else "Biais M30 aligné avec la direction surveillée."
+    )
+    body = (
+        f"Occasion Fibonacci à surveiller sur {pair} en M5.\n"
+        f"Direction envisagée : {direction_label}.\n"
+        f"Zone Fibonacci 50–61,8 % : {zone_low:.5f} à {zone_high:.5f}.\n"
+        f"Prix observé : {float(current_price):.5f}.\n"
+        f"Dernière chandelle clôturée : {candle_time}.\n"
+        f"Contexte M30 : {bias}. {m30_note}\n\n"
+        "ALERTE DE SURVEILLANCE UNIQUEMENT — CE N'EST PAS UN SIGNAL D'ENTRÉE.\n"
+        "Attendre le rejet, la cassure et les confirmations habituelles. "
+        "Ne pas entrer sur la base de ce courriel. Aucun ordre automatique."
+    )
+    append_alert_history({
+        "Heure alerte": now_text, "Heure chandelle": candle_time,
+        "Instrument": pair, "Timeframe": timeframe,
+        "Direction": direction_label, "Etat": "SURVEILLANCE — ZONE FIBONACCI TOUCHÉE",
+        "Zone basse": zone_low, "Zone haute": zone_high,
+        "Prix au signal": current_price, "Mode Fibonacci": fib_mode,
+        "Notes": f"Alerte précoce seulement. Biais M30 : {bias}.",
+    })
+    if not mute_alerts:
+        play_voice_alert(VOICE_STRONG_BULL if direction == "BULL" else VOICE_STRONG_BEAR)
+    if email_alerts_enabled:
+        sent, status = send_email_alert(subject, body)
+        if not sent:
+            st.warning(status)
+    st.info(f"🔎 {pair} M5 : zone Fibonacci touchée — alerte de surveillance {direction_label}; aucune entrée autorisée.")
+    st.session_state[alert_state_key] = signal_key
+
+
 def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, trade_plan):
     """Phase 1: alerte la configuration, mais n'ouvre aucun trade."""
     if setup.get("state") not in ("BULL_CONFIRMED", "BEAR_CONFIRMED"):
@@ -1298,9 +1374,9 @@ summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Analyse + exécution")
 summary[2].metric("DONNÉES", "OANDA", "Actualisation automatique")
 summary[3].metric("MODE", "Surveillance", "Aucun ordre automatique")
 st.caption(
-    "Alertes basées sur le dernier swing confirmé, le retracement Fibonacci "
-    "50–61,8 %, un rejet puis la cassure de son extrême, avec filtre anti-entrée tardive. "
-    "Une deuxième confirmation après retest est exigée avant toute entrée."
+    "Alerte précoce M5 au contact de la zone Fibonacci (surveillance seulement; biais M30 neutre permis). "
+    "L'alerte d'entrée conserve le rejet, la cassure, le filtre M30 aligné, le filtre anti-retard "
+    "et la confirmation après retest. Aucune alerte de surveillance n'autorise une entrée."
 )
 
 for config in instruments_config:
@@ -1438,6 +1514,9 @@ for config in instruments_config:
         trade_plan, trade_message = build_trade_plan(setup, current_price)
 
 
+        process_early_fibonacci_alert(
+            pair, timeframe, setup, candle_time, current_price, closed_df, m30_context
+        )
         process_fibonacci_alert(
             pair, timeframe, setup, candle_time, current_price, trade_plan
         )
