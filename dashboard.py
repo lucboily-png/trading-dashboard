@@ -150,111 +150,29 @@ def _signal_identity(pair, timeframe, fib, fib_mode):
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def create_pending_setup(pair, timeframe, setup, candle_time, trade_plan, fib_mode):
-    """Stocke une configuration en attente; aucun trade n'est encore ouvert."""
+def create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mode):
+    """Enregistre immédiatement un trade virtuel OPEN après un signal confirmé valide."""
     if not supabase_configured():
-        return False, "Supabase requis pour conserver une configuration en attente."
+        return False, "Supabase non configuré."
     if not trade_plan or not setup.get("fib"):
-        return False, "Configuration incomplète."
-
+        return False, "Aucun plan complet à enregistrer."
     fib = setup["fib"]
-    candle_iso = pd.Timestamp(
-        candle_time.replace(" NY", "")
-    ).tz_localize("America/New_York").isoformat()
+    candle_iso = pd.Timestamp(candle_time.replace(" NY", "")).tz_localize("America/New_York").isoformat()
     signal_key = _signal_identity(pair, timeframe, fib, fib_mode.upper())
-    metadata = {
-        "phase": "WAIT_RETEST",
-        "trigger_level": float(setup["trigger_level"]),
-        "zone_low": float(fib["zone_low"]),
-        "zone_high": float(fib["zone_high"]),
-        "atr": float(fib["atr"]),
-        "endpoint_price": float(fib["endpoint"]["price"]),
-        "origin_price": float(fib["origin"]["price"]),
-        "origin_time": str(fib["origin"]["time"]),
-        "endpoint_time": str(fib["endpoint"]["time"]),
-        "manual": bool(fib.get("manual", False)),
-        "retest_seen": False,
-        "retest_high": None,
-        "retest_low": None,
-        "retest_time": None,
-        "bars_elapsed": 0,
-        "last_processed_candle": candle_iso,
-        "max_wait_candles": 6,
-        "retest_tolerance_atr": 0.15,
-        "max_entry_extension_atr": 0.25,
-        "fib_mode": fib_mode.upper(),
-    }
     payload = {
-        "signal_key": signal_key,
-        "instrument": pair,
-        "timeframe": timeframe,
-        "direction": fib["direction"],
-        "fib_mode": fib_mode.upper(),
-        "signal_time": datetime.now(pytz.UTC).isoformat(),
-        "candle_time": candle_iso,
-        # Ces prix sont provisoires et le statut PENDING empêche leur suivi comme trade.
-        "entry_price": float(trade_plan["entry"]),
-        "stop_loss": float(trade_plan["stop_loss"]),
-        "take_profit": float(trade_plan["take_profit"]),
-        "rr": float(trade_plan["rr"]),
-        "status": "PENDING",
-        "notes": json.dumps(metadata, ensure_ascii=False),
+        "signal_key": signal_key, "instrument": pair, "timeframe": timeframe,
+        "direction": fib["direction"], "fib_mode": fib_mode.upper(),
+        "signal_time": datetime.now(pytz.UTC).isoformat(), "candle_time": candle_iso,
+        "entry_price": float(trade_plan["entry"]), "stop_loss": float(trade_plan["stop_loss"]),
+        "take_profit": float(trade_plan["take_profit"]), "rr": float(trade_plan["rr"]),
+        "status": "OPEN",
+        "notes": "Trade virtuel ouvert au signal Fibonacci confirmé; aucun ordre OANDA envoyé.",
     }
     result = supabase_request(
-        "POST", payload=payload,
-        params={"on_conflict": "signal_key"},
+        "POST", payload=payload, params={"on_conflict": "signal_key"},
         prefer="resolution=ignore-duplicates,return=representation",
     )
-    return bool(result), "Configuration en attente enregistrée." if result else "Configuration déjà enregistrée."
-
-
-def activate_pending_setup(pending, confirmation_candle, trade_plan):
-    """Transforme une configuration PENDING en trade OPEN après le retest confirmé."""
-    candle_iso = pd.Timestamp(confirmation_candle["time"]).isoformat()
-    supabase_request(
-        "PATCH",
-        params={"id": f"eq.{pending['id']}", "status": "eq.PENDING"},
-        payload={
-            "status": "OPEN",
-            "candle_time": candle_iso,
-            "entry_price": float(trade_plan["entry"]),
-            "stop_loss": float(trade_plan["stop_loss"]),
-            "take_profit": float(trade_plan["take_profit"]),
-            "rr": float(trade_plan["rr"]),
-            "notes": "Entrée confirmée après retest et nouvelle clôture de confirmation. Trade virtuel; aucun ordre OANDA envoyé.",
-            "updated_at": datetime.now(pytz.UTC).isoformat(),
-        },
-        prefer="return=minimal",
-    )
-
-
-def update_pending_setup(pending_id, metadata, status="PENDING", note=None):
-    payload = {
-        "status": status,
-        "notes": note if note is not None else json.dumps(metadata, ensure_ascii=False),
-        "updated_at": datetime.now(pytz.UTC).isoformat(),
-    }
-    supabase_request(
-        "PATCH",
-        params={"id": f"eq.{pending_id}", "status": "eq.PENDING"},
-        payload=payload,
-        prefer="return=minimal",
-    )
-
-
-def load_pending_setups(pair, timeframe):
-    if not supabase_configured():
-        return []
-    return supabase_request(
-        "GET",
-        params={
-            "select": "*",
-            "status": "eq.PENDING",
-            "instrument": f"eq.{pair}",
-            "timeframe": f"eq.{timeframe}",
-            "order": "candle_time.asc",
-        },
-    )
+    return bool(result), "Trade virtuel ouvert." if result else "Signal déjà enregistré."
 
 
 def monitor_virtual_trades(pair, timeframe, closed_df):
@@ -1097,10 +1015,10 @@ def process_early_fibonacci_alert(pair, timeframe, setup, candle_time, current_p
 
 
 def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, trade_plan):
-    """Phase 1: alerte la configuration, mais n'ouvre aucun trade."""
+    """Ouvre immédiatement un trade virtuel OPEN après confirmation et plan valide."""
     if setup.get("state") not in ("BULL_CONFIRMED", "BEAR_CONFIRMED"):
         return
-    if not trade_plan or not setup.get("fib") or setup.get("trigger_level") is None:
+    if not trade_plan or not setup.get("fib"):
         return
 
     fib = setup["fib"]
@@ -1111,281 +1029,59 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
     alert_state_key = f"fib_alerted_setup_{pair}_{timeframe}"
     if st.session_state.get(alert_state_key) == signal_key:
         return
-
     if not supabase_configured():
-        st.error("Alerte non envoyée : Supabase est nécessaire pour conserver le retest en attente de façon fiable.")
+        st.error("Trade virtuel non créé : vérifie SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY.")
         return
 
     try:
-        saved, message = create_pending_setup(
-            pair, timeframe, setup, candle_time, trade_plan, fib_mode
-        )
+        saved, message = create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mode)
     except Exception as exc:
-        st.error(f"Erreur Supabase — sauvegarde de la configuration : {exc}")
+        st.error(f"Erreur Supabase — création du trade virtuel : {exc}")
         return
-
     if not saved:
         st.info(f"Supabase : {message}")
         st.session_state[alert_state_key] = signal_key
         return
 
-    zone_low = float(fib["zone_low"])
-    zone_high = float(fib["zone_high"])
-    trigger = float(setup["trigger_level"])
+    zone_low, zone_high = float(fib["zone_low"]), float(fib["zone_high"])
     now_text = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
-    subject = f"{'🟡 Configuration ACHAT' if bullish else '🟡 Configuration VENTE'} Fibonacci — {pair} {timeframe}"
+    subject = f"{'🟢 TRADE VIRTUEL ACHAT' if bullish else '🔴 TRADE VIRTUEL VENTE'} Fibonacci — {pair} {timeframe}"
+    fmt = lambda value: f"{float(value):.5f}"
     body = (
-        f"Configuration Fibonacci détectée sur {pair} en {timeframe}.\n"
-        f"Direction : {direction}.\n"
-        f"Zone Fibonacci 50–61,8 % : {zone_low:.5f} à {zone_high:.5f}.\n"
-        f"Niveau de cassure à retester : {trigger:.5f}.\n"
-        f"Prix observé lors du signal : {float(current_price):.5f}.\n"
-        f"Dernière chandelle clôturée : {candle_time}.\n\n"
-        "ATTENTION : ce courriel est une alerte de configuration, PAS une autorisation d'entrée.\n"
-        "Attendre le retour au niveau de cassure, puis une nouvelle chandelle M5/M30 de confirmation.\n"
-        "Une deuxième alerte sera envoyée seulement si l'entrée reste valide. Aucun ordre automatique."
+        f"TRADE VIRTUEL OUVERT — signal Fibonacci confirmé sur {pair} en {timeframe}.\\n"
+        f"Direction : {direction}.\\n"
+        f"Zone Fibonacci 50–61,8 % : {fmt(zone_low)} à {fmt(zone_high)}.\\n"
+        f"Entrée virtuelle : {fmt(trade_plan['entry'])}.\\n"
+        f"Stop-loss : {fmt(trade_plan['stop_loss'])}.\\n"
+        f"Take-profit : {fmt(trade_plan['take_profit'])}.\\n"
+        f"Ratio R/R : 1:{float(trade_plan['rr']):.2f}.\\n"
+        f"Prix observé au signal : {fmt(current_price)}.\\n"
+        f"Dernière chandelle clôturée : {candle_time}.\\n\\n"
+        "Le trade est suivi virtuellement dans le tableau de bord. Aucun ordre OANDA n'est envoyé."
     )
-    record = {
-        "Heure alerte": now_text,
-        "Heure chandelle": candle_time,
-        "Instrument": pair,
-        "Timeframe": timeframe,
-        "Direction": direction,
-        "Etat": "CONFIGURATION — ATTENTE RETEST",
-        "Zone basse": zone_low,
-        "Zone haute": zone_high,
-        "Entree": "",
-        "Stop-loss": "",
-        "Take-profit": "",
-        "R_R": "",
-        "Prix au signal": current_price,
-        "Mode Fibonacci": fib_mode,
-        "Resultat": "",
-        "Notes": f"Niveau à retester : {trigger:.5f}. Aucun trade ouvert.",
-    }
-    append_alert_history(record)
-    st.session_state.setdefault("fib_new_alerts", [])
-    st.session_state["fib_new_alerts"].append({
-        "Heure": now_text,
-        "Instrument": pair,
-        "Timeframe": timeframe,
-        "Signal": subject,
-        "Zone": f"{zone_low:.5f} – {zone_high:.5f}",
-        "Entrée": "En attente du retest",
-        "SL": "—",
-        "TP": "—",
-        "R/R": "—",
+    append_alert_history({
+        "Heure alerte": now_text, "Heure chandelle": candle_time,
+        "Instrument": pair, "Timeframe": timeframe, "Direction": direction,
+        "Etat": "TRADE VIRTUEL OUVERT", "Zone basse": zone_low, "Zone haute": zone_high,
+        "Entree": trade_plan["entry"], "Stop-loss": trade_plan["stop_loss"],
+        "Take-profit": trade_plan["take_profit"], "R_R": trade_plan["rr"],
+        "Prix au signal": current_price, "Mode Fibonacci": fib_mode,
+        "Resultat": "", "Notes": "Trade virtuel OPEN créé dès la confirmation; aucun ordre OANDA envoyé.",
     })
-
+    st.session_state.setdefault("fib_new_alerts", []).append({
+        "Heure": now_text, "Instrument": pair, "Timeframe": timeframe, "Signal": subject,
+        "Zone": f"{zone_low:.5f} – {zone_high:.5f}", "Entrée": fmt(trade_plan["entry"]),
+        "SL": fmt(trade_plan["stop_loss"]), "TP": fmt(trade_plan["take_profit"]),
+        "R/R": f"1:{float(trade_plan['rr']):.2f}",
+    })
     if not mute_alerts:
         play_voice_alert(VOICE_STRONG_BULL if bullish else VOICE_STRONG_BEAR)
     if email_alerts_enabled:
         sent, status = send_email_alert(subject, body)
         if not sent:
             st.warning(status)
-    st.success("Configuration enregistrée : attente du retest avant toute entrée.")
+    st.success(f"{pair} {timeframe} : trade virtuel {direction} ouvert et ajouté au suivi.")
     st.session_state[alert_state_key] = signal_key
-
-
-def process_pending_entries(pair, timeframe, closed_df, current_price, m30_context=None):
-    """Phase 2: attend le retest puis une nouvelle clôture dans le sens du trade."""
-    if not supabase_configured() or closed_df.empty:
-        return
-
-    try:
-        pending_setups = load_pending_setups(pair, timeframe)
-    except Exception as exc:
-        st.warning(f"Erreur Supabase — lecture des configurations en attente : {exc}")
-        return
-
-    for pending in pending_setups:
-        try:
-            meta = json.loads(pending.get("notes") or "{}")
-            if meta.get("phase") != "WAIT_RETEST":
-                continue
-
-            direction = pending["direction"]
-
-            # Un biais M30 neutre/indisponible met le suivi en pause :
-            # la configuration reste PENDING, sans consommer son délai de retest.
-            # On avance le curseur pour ne pas déclencher une entrée sur de vieilles chandelles
-            # lorsque le biais M30 redeviendra directionnel.
-            if timeframe == "M5" and (
-                not m30_context or m30_context.get("bias") not in ("BULL", "BEAR")
-            ):
-                latest_candle = pd.to_datetime(closed_df.iloc[-1]["time"], utc=True)
-                meta["last_processed_candle"] = latest_candle.isoformat()
-                update_pending_setup(pending["id"], meta)
-                continue
-
-            # Un biais M30 clairement opposé invalide toujours la configuration.
-            if timeframe == "M5" and m30_context.get("bias") != direction:
-                update_pending_setup(
-                    pending["id"], meta, status="EXPIRED",
-                    note=("Configuration M5 annulée : le biais M30 est maintenant opposé "
-                          "à la direction du setup avant la confirmation.")
-                )
-                st.info(f"{pair} M5 : configuration annulée — biais M30 opposé.")
-                continue
-            trigger = float(meta["trigger_level"])
-            atr = float(meta["atr"])
-            tolerance = float(meta.get("retest_tolerance_atr", 0.15)) * atr
-            max_extension = float(meta.get("max_entry_extension_atr", 0.25)) * atr
-            max_wait = int(meta.get("max_wait_candles", 6))
-            stop = float(pending["stop_loss"])
-            last_processed = pd.to_datetime(meta["last_processed_candle"], utc=True)
-
-            candles = closed_df.copy()
-            candles["_utc_time"] = pd.to_datetime(candles["time"], utc=True)
-            later = candles[candles["_utc_time"] > last_processed]
-            if later.empty:
-                continue
-
-            completed_trade = False
-            expired_note = None
-            for _, candle in later.iterrows():
-                high, low = float(candle["high"]), float(candle["low"])
-                open_price, close = float(candle["open"]), float(candle["close"])
-                candle_stamp = pd.Timestamp(candle["time"]).isoformat()
-                meta["last_processed_candle"] = candle_stamp
-                meta["bars_elapsed"] = int(meta.get("bars_elapsed", 0)) + 1
-                if meta["bars_elapsed"] > max_wait:
-                    expired_note = "Configuration expirée : délai maximal de retest et de confirmation dépassé."
-                    break
-
-                # Invalidation avant entrée : si le stop théorique est touché, on annule.
-                stop_touched = (low <= stop) if direction == "BULL" else (high >= stop)
-                if stop_touched:
-                    expired_note = "Configuration annulée : le stop théorique a été touché avant l'entrée confirmée."
-                    break
-
-                # Le retest doit revenir près du niveau de cassure.
-                if not meta.get("retest_seen"):
-                    retest_band_low = trigger - tolerance
-                    retest_band_high = trigger + tolerance
-                    overlaps_retest = low <= retest_band_high and high >= retest_band_low
-                    if overlaps_retest:
-                        meta["retest_seen"] = True
-                        meta["retest_high"] = high
-                        meta["retest_low"] = low
-                        meta["retest_time"] = candle_stamp
-                    if meta["bars_elapsed"] >= max_wait and not meta.get("retest_seen"):
-                        expired_note = "Configuration expirée : aucun retest du niveau de cassure dans le délai prévu."
-                        break
-                    # Confirmation obligatoire sur une chandelle ultérieure.
-                    continue
-
-                # La chandelle de confirmation doit être postérieure à celle du retest.
-                if direction == "BULL":
-                    confirmed = close > open_price and close > float(meta["retest_high"])
-                    extension = max(0.0, close - trigger)
-                else:
-                    confirmed = close < open_price and close < float(meta["retest_low"])
-                    extension = max(0.0, trigger - close)
-
-                if confirmed:
-                    if extension > max_extension:
-                        expired_note = (
-                            "Configuration annulée : la confirmation est arrivée trop loin du niveau de retest; "
-                            "aucune entrée tardive n'est autorisée."
-                        )
-                        break
-
-                    fib = {
-                        "direction": direction,
-                        "zone_low": float(meta["zone_low"]),
-                        "zone_high": float(meta["zone_high"]),
-                        "atr": atr,
-                        "endpoint": {"price": float(meta["endpoint_price"])},
-                        "origin": {"price": float(meta["origin_price"])},
-                        "manual": bool(meta.get("manual", False)),
-                    }
-                    setup = {"state": direction + "_CONFIRMED", "fib": fib}
-                    # Utilise la clôture de la chandelle de confirmation, pas un prix live potentiellement éloigné.
-                    final_plan, plan_message = build_trade_plan(setup, close)
-                    if not final_plan:
-                        expired_note = f"Configuration annulée après retest : {plan_message}"
-                        break
-
-                    activate_pending_setup(pending, candle, final_plan)
-                    now_text = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
-                    direction_label = "ACHAT" if direction == "BULL" else "VENTE"
-                    subject = f"{'🟢 ENTRÉE ACHAT' if direction == 'BULL' else '🔴 ENTRÉE VENTE'} confirmée après retest — {pair} {timeframe}"
-                    body = (
-                        f"ENTRÉE POTENTIELLE CONFIRMÉE après retest sur {pair} en {timeframe}.\n"
-                        f"Direction : {direction_label}.\n"
-                        f"Entrée indicative (clôture de confirmation) : {final_plan['entry']:.5f}.\n"
-                        f"Stop-loss : {final_plan['stop_loss']:.5f}.\n"
-                        f"Take-profit : {final_plan['take_profit']:.5f}.\n"
-                        f"Ratio R/R : 1:{final_plan['rr']:.2f}.\n"
-                        f"Niveau retesté : {trigger:.5f}.\n"
-                        f"Chandelle de confirmation : {candle_stamp}.\n\n"
-                        "Le retest et la reprise ont été confirmés sur le même timeframe que le signal initial. "
-                        "Valider le prix disponible avant toute exécution. Aucun ordre automatique n'est envoyé."
-                    )
-                    record = {
-                        "Heure alerte": now_text,
-                        "Heure chandelle": candle_stamp,
-                        "Instrument": pair,
-                        "Timeframe": timeframe,
-                        "Direction": direction_label,
-                        "Etat": "ENTREE CONFIRMEE APRES RETEST",
-                        "Zone basse": meta["zone_low"],
-                        "Zone haute": meta["zone_high"],
-                        "Entree": final_plan["entry"],
-                        "Stop-loss": final_plan["stop_loss"],
-                        "Take-profit": final_plan["take_profit"],
-                        "R_R": final_plan["rr"],
-                        "Prix au signal": close,
-                        "Mode Fibonacci": meta.get("fib_mode", "AUTOMATIQUE"),
-                        "Resultat": "",
-                        "Notes": "Retest puis confirmation sur chandelle clôturée; trade virtuel activé.",
-                    }
-                    append_alert_history(record)
-                    st.session_state.setdefault("fib_new_alerts", [])
-                    st.session_state["fib_new_alerts"].append({
-                        "Heure": now_text,
-                        "Instrument": pair,
-                        "Timeframe": timeframe,
-                        "Signal": subject,
-                        "Zone": f"{float(meta['zone_low']):.5f} – {float(meta['zone_high']):.5f}",
-                        "Entrée": f"{final_plan['entry']:.5f}",
-                        "SL": f"{final_plan['stop_loss']:.5f}",
-                        "TP": f"{final_plan['take_profit']:.5f}",
-                        "R/R": f"1:{final_plan['rr']:.2f}",
-                    })
-                    if not mute_alerts:
-                        play_voice_alert(VOICE_STRONG_BULL if direction == "BULL" else VOICE_STRONG_BEAR)
-                    if email_alerts_enabled:
-                        sent, status = send_email_alert(subject, body)
-                        if not sent:
-                            st.warning(status)
-                    st.success(f"{pair} {timeframe} : entrée confirmée après retest. Trade virtuel activé.")
-                    completed_trade = True
-                    break
-
-                if meta["bars_elapsed"] >= max_wait:
-                    expired_note = "Configuration expirée : retest observé, mais aucune reprise confirmée dans le délai prévu."
-                    break
-
-            if completed_trade:
-                continue
-            if expired_note:
-                update_pending_setup(pending["id"], meta, status="EXPIRED", note=expired_note)
-                st.info(f"{pair} {timeframe} : {expired_note}")
-            else:
-                update_pending_setup(pending["id"], meta)
-                if meta.get("retest_seen"):
-                    st.info(
-                        f"{pair} {timeframe} : retest détecté à {trigger:.5f}; "
-                        "attente d'une nouvelle chandelle clôturée de confirmation."
-                    )
-                else:
-                    st.info(
-                        f"{pair} {timeframe} : configuration en attente du retest de {trigger:.5f}."
-                    )
-        except Exception as exc:
-            st.warning(f"Erreur de suivi du retest {pair} {timeframe} : {exc}")
 
 
 # MAIN DASHBOARD — en-tête visuel uniquement
@@ -1431,10 +1127,9 @@ summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Analyse + exécution")
 summary[2].metric("DONNÉES", "OANDA", "Actualisation automatique")
 summary[3].metric("MODE", "Surveillance", "Aucun ordre automatique")
 st.caption(
-    "Alertes de surveillance M5 à l'approche (jusqu'à 0,75 ATR) et au contact actuel de la zone Fibonacci; "
-    "un ancien toucher de zone ne déclenche plus d'alerte tardive. Biais M30 neutre permis en surveillance. "
-    "L'entrée conserve le rejet, la cassure, le filtre M30 aligné, le filtre anti-retard et le retest. "
-    "Aucune alerte de surveillance n'autorise une entrée."
+    "Alertes de surveillance M5 à l’approche et au contact de la zone Fibonacci. "
+    "Le trade virtuel s’ouvre à la confirmation si le plan est valide et, sur M5, si le biais M30 est aligné. "
+    "Le suivi TP/SL est effectué sur les chandelles clôturées. Aucun ordre automatique n’est envoyé."
 )
 
 for config in instruments_config:
@@ -1578,7 +1273,6 @@ for config in instruments_config:
         process_fibonacci_alert(
             pair, timeframe, setup, candle_time, current_price, trade_plan
         )
-        process_pending_entries(pair, timeframe, closed_df, current_price, m30_context)
 
         st.markdown(
             f"<h4 style='color:{setup['color']};'>{setup['label']}</h4>",
