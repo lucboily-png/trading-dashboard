@@ -968,16 +968,17 @@ def load_alert_history():
 
 def process_early_fibonacci_alert(pair, timeframe, setup, candle_time, current_price,
                                   closed_df, m30_context=None):
-    """Alerte précoce M5 au premier contact de la zone Fibonacci.
+    """Alerte M5 d'approche ou de contact ACTUEL de la zone Fibonacci.
 
-    Cette notification signale une occasion à surveiller, jamais une entrée.
-    Le biais M30 neutre est permis; un biais M30 franchement opposé bloque
-    uniquement cette alerte précoce. La confirmation d'entrée reste inchangée.
+    Ne déclenche jamais une alerte à partir d'une ancienne chandelle clôturée
+    qui a touché la zone si le prix l'a déjà quittée. L'approche est signalée
+    à moins de 0,75 ATR du bord d'entrée; le contact est signalé si le prix
+    observé est actuellement dans la zone. Ces alertes ne sont pas des entrées.
     """
     if timeframe != "M5" or not setup.get("fib") or closed_df.empty:
         return
     if setup.get("state") not in ("BULL_TRACKING", "BEAR_TRACKING",
-                                    "BULL_WAIT", "BEAR_WAIT"):
+                                  "BULL_WAIT", "BEAR_WAIT"):
         return
 
     fib = setup["fib"]
@@ -990,55 +991,108 @@ def process_early_fibonacci_alert(pair, timeframe, setup, candle_time, current_p
     if bias in ("BULL", "BEAR") and bias != direction:
         return
 
-    last = closed_df.iloc[-1]
-    last_candle_touched = (
-        float(last["low"]) <= float(fib["zone_high"])
-        and float(last["high"]) >= float(fib["zone_low"])
-    )
-    live_in_zone = float(fib["zone_low"]) <= float(current_price) <= float(fib["zone_high"])
-    if not (last_candle_touched or live_in_zone):
+    zone_low = float(fib["zone_low"])
+    zone_high = float(fib["zone_high"])
+    price = float(current_price)
+    atr = float(fib.get("atr") or 0)
+    if atr <= 0:
+        return
+
+    # Pour une vente, le retracement remonte vers la zone par-dessous.
+    # Pour un achat, il redescend vers la zone par-dessus.
+    approach_buffer = 0.75 * atr
+    if zone_low <= price <= zone_high:
+        alert_phase = "CONTACT"
+        phase_label = "CONTACT ACTUEL AVEC LA ZONE"
+        distance_to_zone = 0.0
+    elif direction == "BEAR" and price < zone_low:
+        distance_to_zone = zone_low - price
+        last_closed_price = float(closed_df.iloc[-1]["close"])
+        # Une vente se prépare sur un retracement qui remonte vers la zone.
+        if distance_to_zone > approach_buffer or price <= last_closed_price:
+            return
+        alert_phase = "APPROCHE"
+        phase_label = "APPROCHE DE LA ZONE"
+    elif direction == "BULL" and price > zone_high:
+        distance_to_zone = price - zone_high
+        last_closed_price = float(closed_df.iloc[-1]["close"])
+        # Un achat se prépare sur un retracement qui redescend vers la zone.
+        if distance_to_zone > approach_buffer or price >= last_closed_price:
+            return
+        alert_phase = "APPROCHE"
+        phase_label = "APPROCHE DE LA ZONE"
+    else:
+        # Prix déjà passé au-delà de la zone : aucune alerte tardive.
         return
 
     fib_mode = "MANUEL" if fib.get("manual") else "AUTOMATIQUE"
     signal_key = _signal_identity(pair, timeframe, fib, fib_mode)
-    alert_state_key = f"fib_early_alerted_setup_{pair}_{timeframe}"
+    alert_state_key = (
+        f"fib_early_{alert_phase.lower()}_alerted_setup_{pair}_{timeframe}"
+    )
     if st.session_state.get(alert_state_key) == signal_key:
         return
 
     direction_label = "ACHAT" if direction == "BULL" else "VENTE"
-    zone_low, zone_high = float(fib["zone_low"]), float(fib["zone_high"])
-    now_text = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
-    subject = f"🔎 Surveillance {direction_label} Fibonacci — {pair} M5"
+    now_text = datetime.now(pytz.timezone("America/New_York")).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    subject = (
+        f"🔎 {phase_label.title()} — Surveillance {direction_label} "
+        f"Fibonacci — {pair} M5"
+    )
     m30_note = (
         "Biais M30 neutre : surveillance permise, confirmation M30 non acquise."
-        if bias == "NEUTRAL" else "Biais M30 aligné avec la direction surveillée."
+        if bias == "NEUTRAL"
+        else "Biais M30 aligné avec la direction surveillée."
+    )
+    phase_detail = (
+        f"Distance du bord de zone : {distance_to_zone:.5f} "
+        f"(seuil d'approche : {approach_buffer:.5f}, soit 0,75 ATR)."
+        if alert_phase == "APPROCHE"
+        else "Le prix observé se trouve actuellement à l'intérieur de la zone."
     )
     body = (
-        f"Occasion Fibonacci à surveiller sur {pair} en M5.\n"
-        f"Direction envisagée : {direction_label}.\n"
-        f"Zone Fibonacci 50–61,8 % : {zone_low:.5f} à {zone_high:.5f}.\n"
-        f"Prix observé : {float(current_price):.5f}.\n"
-        f"Dernière chandelle clôturée : {candle_time}.\n"
-        f"Contexte M30 : {bias}. {m30_note}\n\n"
-        "ALERTE DE SURVEILLANCE UNIQUEMENT — CE N'EST PAS UN SIGNAL D'ENTRÉE.\n"
+        f"{phase_label} Fibonacci sur {pair} en M5.\\n"
+        f"Direction envisagée : {direction_label}.\\n"
+        f"Zone Fibonacci 50–61,8 % : {zone_low:.5f} à {zone_high:.5f}.\\n"
+        f"Prix observé : {price:.5f}.\\n"
+        f"{phase_detail}\\n"
+        f"Dernière chandelle clôturée : {candle_time}.\\n"
+        f"Contexte M30 : {bias}. {m30_note}\\n\\n"
+        "ALERTE DE SURVEILLANCE UNIQUEMENT — CE N'EST PAS UN SIGNAL D'ENTRÉE.\\n"
         "Attendre le rejet, la cassure et les confirmations habituelles. "
         "Ne pas entrer sur la base de ce courriel. Aucun ordre automatique."
     )
     append_alert_history({
-        "Heure alerte": now_text, "Heure chandelle": candle_time,
-        "Instrument": pair, "Timeframe": timeframe,
-        "Direction": direction_label, "Etat": "SURVEILLANCE — ZONE FIBONACCI TOUCHÉE",
-        "Zone basse": zone_low, "Zone haute": zone_high,
-        "Prix au signal": current_price, "Mode Fibonacci": fib_mode,
-        "Notes": f"Alerte précoce seulement. Biais M30 : {bias}.",
+        "Heure alerte": now_text,
+        "Heure chandelle": candle_time,
+        "Instrument": pair,
+        "Timeframe": timeframe,
+        "Direction": direction_label,
+        "Etat": f"SURVEILLANCE — {alert_phase} FIBONACCI",
+        "Zone basse": zone_low,
+        "Zone haute": zone_high,
+        "Prix au signal": price,
+        "Mode Fibonacci": fib_mode,
+        "Notes": (
+            f"{phase_label}. Distance : {distance_to_zone:.5f}. "
+            f"Biais M30 : {bias}."
+        ),
     })
     if not mute_alerts:
-        play_voice_alert(VOICE_STRONG_BULL if direction == "BULL" else VOICE_STRONG_BEAR)
+        play_voice_alert(
+            VOICE_STRONG_BULL if direction == "BULL" else VOICE_STRONG_BEAR
+        )
     if email_alerts_enabled:
         sent, status = send_email_alert(subject, body)
         if not sent:
             st.warning(status)
-    st.info(f"🔎 {pair} M5 : zone Fibonacci touchée — alerte de surveillance {direction_label}; aucune entrée autorisée.")
+
+    st.info(
+        f"🔎 {pair} M5 : {phase_label.lower()} — "
+        f"surveillance {direction_label}; aucune entrée autorisée."
+    )
     st.session_state[alert_state_key] = signal_key
 
 
@@ -1374,9 +1428,10 @@ summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Analyse + exécution")
 summary[2].metric("DONNÉES", "OANDA", "Actualisation automatique")
 summary[3].metric("MODE", "Surveillance", "Aucun ordre automatique")
 st.caption(
-    "Alerte précoce M5 au contact de la zone Fibonacci (surveillance seulement; biais M30 neutre permis). "
-    "L'alerte d'entrée conserve le rejet, la cassure, le filtre M30 aligné, le filtre anti-retard "
-    "et la confirmation après retest. Aucune alerte de surveillance n'autorise une entrée."
+    "Alertes de surveillance M5 à l'approche (jusqu'à 0,75 ATR) et au contact actuel de la zone Fibonacci; "
+    "un ancien toucher de zone ne déclenche plus d'alerte tardive. Biais M30 neutre permis en surveillance. "
+    "L'entrée conserve le rejet, la cassure, le filtre M30 aligné, le filtre anti-retard et le retest. "
+    "Aucune alerte de surveillance n'autorise une entrée."
 )
 
 for config in instruments_config:
