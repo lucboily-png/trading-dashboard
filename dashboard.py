@@ -753,16 +753,27 @@ def evaluate_fibonacci_setup(
                  else "🟢 ACHAT — CASSURE DU REJET CONFIRMÉE")
         wait_label = "🟡 Zone d'achat Fibonacci — attente du rejet et de la cassure"
         zone_name = "ZONE D'ACHAT"
-        rejection_condition = lambda row: (
-            float(row["close"]) > float(row["open"])
-            and float(row["close"]) > zone_high
-        )
+        if timeframe == "M30":
+            # M30 : accepte un rejet haussier depuis le bas de la zone même si
+            # la clôture reste à l'intérieur du Fibonacci. La cassure du sommet
+            # de cette chandelle par la chandelle suivante sera obligatoire.
+            rejection_condition = lambda row: (
+                float(row["close"]) > float(row["open"])
+                and float(row["close"]) > zone_low
+                and (float(row["close"]) - float(row["low"]))
+                    >= 0.55 * max(float(row["high"]) - float(row["low"]), 1e-12)
+            )
+        else:
+            rejection_condition = lambda row: (
+                float(row["close"]) > float(row["open"])
+                and float(row["close"]) > zone_high
+            )
         trigger_broken = lambda row, rejection: (
             float(row["close"]) > float(rejection["high"])
         )
         details = (
-            "Rejet haussier confirmé en M30 : la chandelle a visité la zone 50–61,8 % "
-            "et clôturé au-dessus de son bord supérieur."
+            "Rejet haussier M30 détecté dans la zone 50–61,8 %. Le signal sera confirmé "
+            "uniquement si une chandelle suivante clôture au-dessus du sommet du rejet."
             if timeframe == "M30" else
             "Après le retour dans la zone 50–61,8 %, le système attend une "
             "chandelle de rejet haussière, puis la clôture d'une chandelle "
@@ -773,26 +784,39 @@ def evaluate_fibonacci_setup(
                  else "🔴 VENTE — CASSURE DU REJET CONFIRMÉE")
         wait_label = "🟡 Zone de vente Fibonacci — attente du rejet et de la cassure"
         zone_name = "ZONE DE VENTE"
-        rejection_condition = lambda row: (
-            float(row["close"]) < float(row["open"])
-            and float(row["close"]) < zone_low
-        )
+        if timeframe == "M30":
+            # M30 : accepte un rejet baissier depuis le haut de la zone même si
+            # la clôture reste à l'intérieur du Fibonacci. La cassure du creux
+            # de cette chandelle par la chandelle suivante sera obligatoire.
+            rejection_condition = lambda row: (
+                float(row["close"]) < float(row["open"])
+                and float(row["close"]) < zone_high
+                and (float(row["high"]) - float(row["close"]))
+                    >= 0.55 * max(float(row["high"]) - float(row["low"]), 1e-12)
+            )
+        else:
+            rejection_condition = lambda row: (
+                float(row["close"]) < float(row["open"])
+                and float(row["close"]) < zone_low
+            )
         trigger_broken = lambda row, rejection: (
             float(row["close"]) < float(rejection["low"])
         )
         details = (
-            "Rejet baissier confirmé en M30 : la chandelle a visité la zone 50–61,8 % "
-            "et clôturé sous son bord inférieur."
+            "Rejet baissier M30 détecté dans la zone 50–61,8 %. Le signal sera confirmé "
+            "uniquement si une chandelle suivante clôture sous le creux du rejet."
             if timeframe == "M30" else
             "Après le retour dans la zone 50–61,8 %, le système attend une "
             "chandelle de rejet baissière, puis la clôture d'une chandelle "
             "sous son plus bas."
         )
 
-    # En M30, un rejet net clôturé dans le bon sens suffit comme confirmation :
-    # le prix a visité la zone et la chandelle clôture au-delà du bord de zone.
-    # En M5, on conserve une confirmation en deux temps (rejet puis cassure),
-    # afin d'éviter les entrées sur une simple mèche.
+    # M30 et M5 utilisent maintenant une confirmation en deux temps :
+    # 1) une chandelle rejette la zone Fibonacci dans le bon sens;
+    # 2) une chandelle clôturée suivante casse le haut/bas de cette chandelle.
+    # En M30, le rejet peut clôturer à l'intérieur de la zone : cela permet de
+    # détecter un rebond propre depuis le bord 61,8 % sans exiger une clôture
+    # déjà trop éloignée du niveau de retracement.
     last_overlaps_zone = (
         float(last["low"]) <= zone_high and float(last["high"]) >= zone_low
     )
@@ -802,17 +826,9 @@ def evaluate_fibonacci_setup(
     trigger_level = None
     candles_waited = None
 
-    if timeframe == "M30" and last_overlaps_zone and rejection_condition(last):
-        rejection = last
-        rejection_index = len(data) - 1
-        candles_waited = 0
-        confirmed = True
-        trigger_level = (
-            float(last["high"]) if direction == "BULL" else float(last["low"])
-        )
-
     # Cherche la dernière chandelle de rejet clôturée AVANT la dernière chandelle.
-    # En M5, la dernière chandelle doit ensuite casser son extrême dans le bon sens.
+    # La dernière chandelle doit ensuite casser son extrême dans le bon sens,
+    # y compris en M30 : aucune alerte sur la seule couleur d'une chandelle.
     prior = data.iloc[touch_start:-1]
     if not confirmed:
         for idx in range(len(prior) - 1, -1, -1):
@@ -862,9 +878,9 @@ def evaluate_fibonacci_setup(
             return {
                 "state": direction + "_TOO_LATE",
                 "label": (
-                    "⚠️ VENTE — CASSURE CONFIRMÉE, ENTRÉE TROP TARDIVE"
+                    "⚠️ VENTE — CONFIRMATION TROP ÉLOIGNÉE, ENTRÉE TARDIVE"
                     if direction == "BEAR"
-                    else "⚠️ ACHAT — CASSURE CONFIRMÉE, ENTRÉE TROP TARDIVE"
+                    else "⚠️ ACHAT — CONFIRMATION TROP ÉLOIGNÉE, ENTRÉE TARDIVE"
                 ),
                 "color": "orange",
                 "details": "La cassure est confirmée, mais le prix est déjà trop "
