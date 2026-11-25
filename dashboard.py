@@ -235,8 +235,15 @@ def monitor_virtual_trades(pair, timeframe, closed_df):
     candles = closed_df.copy()
     candles["_utc_time"] = pd.to_datetime(candles["time"], utc=True)
     for trade in trades:
+        # Ne jamais évaluer la chandelle qui contient l'ouverture du trade.
+        # OANDA horodate les chandelles à leur heure de départ; signal_time
+        # est donc le repère le plus précis pour trouver les chandelles suivantes.
         signal_candle_time = pd.to_datetime(trade["candle_time"], utc=True)
-        later = candles[candles["_utc_time"] > signal_candle_time]
+        signal_time = pd.to_datetime(
+            trade.get("signal_time") or trade["candle_time"], utc=True
+        )
+        monitoring_start = max(signal_candle_time, signal_time)
+        later = candles[candles["_utc_time"] > monitoring_start]
         for _, candle in later.iterrows():
             high = float(candle["high"])
             low = float(candle["low"])
