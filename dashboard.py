@@ -172,7 +172,47 @@ def create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mo
         "POST", payload=payload, params={"on_conflict": "signal_key"},
         prefer="resolution=ignore-duplicates,return=representation",
     )
-    return bool(result), "Trade virtuel ouvert." if result else "Signal déjà enregistré."
+    if result:
+        return True, "Trade virtuel ouvert."
+
+    # Une ancienne version du dashboard pouvait laisser un signal en PENDING.
+    # Comme signal_key est unique, un nouvel INSERT serait ignoré : on convertit
+    # donc cet ancien dossier en trade OPEN au lieu de perdre le signal.
+    existing = supabase_request(
+        "GET",
+        params={
+            "select": "id,status",
+            "signal_key": f"eq.{signal_key}",
+            "limit": "1",
+        },
+    )
+    if existing:
+        previous = existing[0]
+        if str(previous.get("status", "")).upper() == "PENDING":
+            supabase_request(
+                "PATCH",
+                params={"id": f"eq.{previous['id']}"},
+                payload={
+                    "instrument": pair,
+                    "timeframe": timeframe,
+                    "direction": fib["direction"],
+                    "fib_mode": fib_mode.upper(),
+                    "signal_time": payload["signal_time"],
+                    "candle_time": candle_iso,
+                    "entry_price": payload["entry_price"],
+                    "stop_loss": payload["stop_loss"],
+                    "take_profit": payload["take_profit"],
+                    "rr": payload["rr"],
+                    "status": "OPEN",
+                    "notes": "Ancien signal PENDING converti en trade virtuel OPEN après confirmation Fibonacci.",
+                    "updated_at": datetime.now(pytz.UTC).isoformat(),
+                },
+                prefer="return=minimal",
+            )
+            return True, "Ancien signal en attente converti en trade virtuel ouvert."
+        return False, f"Signal déjà enregistré ({previous.get('status', 'statut inconnu')})."
+
+    return False, "Signal déjà enregistré."
 
 
 def monitor_virtual_trades(pair, timeframe, closed_df):
@@ -605,6 +645,7 @@ def evaluate_fibonacci_setup(
     df,
     current_price=None,
     fib_override=None,
+    timeframe="M5",
     max_close_extension_atr=0.50,
     max_live_extension_atr=0.35,
     max_trigger_wait_candles=3
@@ -643,7 +684,8 @@ def evaluate_fibonacci_setup(
     in_zone = zone_low <= live <= zone_high
 
     if direction == "BULL":
-        label = "🟢 ACHAT — CASSURE DU REJET CONFIRMÉE"
+        label = ("🟢 ACHAT — REJET FIBONACCI M30 CONFIRMÉ" if timeframe == "M30"
+                 else "🟢 ACHAT — CASSURE DU REJET CONFIRMÉE")
         wait_label = "🟡 Zone d'achat Fibonacci — attente du rejet et de la cassure"
         zone_name = "ZONE D'ACHAT"
         rejection_condition = lambda row: (
@@ -654,12 +696,16 @@ def evaluate_fibonacci_setup(
             float(row["close"]) > float(rejection["high"])
         )
         details = (
+            "Rejet haussier confirmé en M30 : la chandelle a visité la zone 50–61,8 % "
+            "et clôturé au-dessus de son bord supérieur."
+            if timeframe == "M30" else
             "Après le retour dans la zone 50–61,8 %, le système attend une "
             "chandelle de rejet haussière, puis la clôture d'une chandelle "
             "au-dessus de son plus haut."
         )
     else:
-        label = "🔴 VENTE — CASSURE DU REJET CONFIRMÉE"
+        label = ("🔴 VENTE — REJET FIBONACCI M30 CONFIRMÉ" if timeframe == "M30"
+                 else "🔴 VENTE — CASSURE DU REJET CONFIRMÉE")
         wait_label = "🟡 Zone de vente Fibonacci — attente du rejet et de la cassure"
         zone_name = "ZONE DE VENTE"
         rejection_condition = lambda row: (
@@ -670,30 +716,51 @@ def evaluate_fibonacci_setup(
             float(row["close"]) < float(rejection["low"])
         )
         details = (
+            "Rejet baissier confirmé en M30 : la chandelle a visité la zone 50–61,8 % "
+            "et clôturé sous son bord inférieur."
+            if timeframe == "M30" else
             "Après le retour dans la zone 50–61,8 %, le système attend une "
             "chandelle de rejet baissière, puis la clôture d'une chandelle "
             "sous son plus bas."
         )
 
-    # Cherche la dernière chandelle de rejet clôturée AVANT la dernière chandelle.
-    # La dernière chandelle doit ensuite casser son extrême dans le bon sens.
-    prior = data.iloc[touch_start:-1]
+    # En M30, un rejet net clôturé dans le bon sens suffit comme confirmation :
+    # le prix a visité la zone et la chandelle clôture au-delà du bord de zone.
+    # En M5, on conserve une confirmation en deux temps (rejet puis cassure),
+    # afin d'éviter les entrées sur une simple mèche.
+    last_overlaps_zone = (
+        float(last["low"]) <= zone_high and float(last["high"]) >= zone_low
+    )
     rejection = None
     rejection_index = None
-    for idx in range(len(prior) - 1, -1, -1):
-        row = prior.iloc[idx]
-        overlaps_zone = (
-            float(row["low"]) <= zone_high and float(row["high"]) >= zone_low
-        )
-        if overlaps_zone and rejection_condition(row):
-            rejection = row
-            rejection_index = touch_start + idx
-            break
-
     confirmed = False
     trigger_level = None
     candles_waited = None
-    if rejection is not None:
+
+    if timeframe == "M30" and last_overlaps_zone and rejection_condition(last):
+        rejection = last
+        rejection_index = len(data) - 1
+        candles_waited = 0
+        confirmed = True
+        trigger_level = (
+            float(last["high"]) if direction == "BULL" else float(last["low"])
+        )
+
+    # Cherche la dernière chandelle de rejet clôturée AVANT la dernière chandelle.
+    # En M5, la dernière chandelle doit ensuite casser son extrême dans le bon sens.
+    prior = data.iloc[touch_start:-1]
+    if not confirmed:
+        for idx in range(len(prior) - 1, -1, -1):
+            row = prior.iloc[idx]
+            overlaps_zone = (
+                float(row["low"]) <= zone_high and float(row["high"]) >= zone_low
+            )
+            if overlaps_zone and rejection_condition(row):
+                rejection = row
+                rejection_index = touch_start + idx
+                break
+
+    if not confirmed and rejection is not None:
         candles_waited = len(data) - 1 - rejection_index
         if 1 <= candles_waited <= max_trigger_wait_candles:
             confirmed = trigger_broken(last, rejection)
@@ -884,136 +951,6 @@ def load_alert_history():
         return pd.DataFrame(columns=ALERT_COLUMNS)
 
 
-def process_early_fibonacci_alert(pair, timeframe, setup, candle_time, current_price,
-                                  closed_df, m30_context=None):
-    """Alerte M5 d'approche ou de contact ACTUEL de la zone Fibonacci.
-
-    Ne déclenche jamais une alerte à partir d'une ancienne chandelle clôturée
-    qui a touché la zone si le prix l'a déjà quittée. L'approche est signalée
-    à moins de 0,75 ATR du bord d'entrée; le contact est signalé si le prix
-    observé est actuellement dans la zone. Ces alertes ne sont pas des entrées.
-    """
-    if timeframe != "M5" or not setup.get("fib") or closed_df.empty:
-        return
-    if setup.get("state") not in ("BULL_TRACKING", "BEAR_TRACKING",
-                                  "BULL_WAIT", "BEAR_WAIT"):
-        return
-
-    fib = setup["fib"]
-    direction = fib.get("direction")
-    if direction not in ("BULL", "BEAR"):
-        return
-
-    # M30 neutre autorisé pour la surveillance; biais opposé = pas d'alerte.
-    bias = (m30_context or {}).get("bias", "NEUTRAL")
-    if bias in ("BULL", "BEAR") and bias != direction:
-        return
-
-    zone_low = float(fib["zone_low"])
-    zone_high = float(fib["zone_high"])
-    price = float(current_price)
-    atr = float(fib.get("atr") or 0)
-    if atr <= 0:
-        return
-
-    # Pour une vente, le retracement remonte vers la zone par-dessous.
-    # Pour un achat, il redescend vers la zone par-dessus.
-    approach_buffer = 0.75 * atr
-    if zone_low <= price <= zone_high:
-        alert_phase = "CONTACT"
-        phase_label = "CONTACT ACTUEL AVEC LA ZONE"
-        distance_to_zone = 0.0
-    elif direction == "BEAR" and price < zone_low:
-        distance_to_zone = zone_low - price
-        last_closed_price = float(closed_df.iloc[-1]["close"])
-        # Une vente se prépare sur un retracement qui remonte vers la zone.
-        if distance_to_zone > approach_buffer or price <= last_closed_price:
-            return
-        alert_phase = "APPROCHE"
-        phase_label = "APPROCHE DE LA ZONE"
-    elif direction == "BULL" and price > zone_high:
-        distance_to_zone = price - zone_high
-        last_closed_price = float(closed_df.iloc[-1]["close"])
-        # Un achat se prépare sur un retracement qui redescend vers la zone.
-        if distance_to_zone > approach_buffer or price >= last_closed_price:
-            return
-        alert_phase = "APPROCHE"
-        phase_label = "APPROCHE DE LA ZONE"
-    else:
-        # Prix déjà passé au-delà de la zone : aucune alerte tardive.
-        return
-
-    fib_mode = "MANUEL" if fib.get("manual") else "AUTOMATIQUE"
-    signal_key = _signal_identity(pair, timeframe, fib, fib_mode)
-    alert_state_key = (
-        f"fib_early_{alert_phase.lower()}_alerted_setup_{pair}_{timeframe}"
-    )
-    if st.session_state.get(alert_state_key) == signal_key:
-        return
-
-    direction_label = "ACHAT" if direction == "BULL" else "VENTE"
-    now_text = datetime.now(pytz.timezone("America/New_York")).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-    subject = (
-        f"🔎 {phase_label.title()} — Surveillance {direction_label} "
-        f"Fibonacci — {pair} M5"
-    )
-    m30_note = (
-        "Biais M30 neutre : surveillance permise, confirmation M30 non acquise."
-        if bias == "NEUTRAL"
-        else "Biais M30 aligné avec la direction surveillée."
-    )
-    phase_detail = (
-        f"Distance du bord de zone : {distance_to_zone:.5f} "
-        f"(seuil d'approche : {approach_buffer:.5f}, soit 0,75 ATR)."
-        if alert_phase == "APPROCHE"
-        else "Le prix observé se trouve actuellement à l'intérieur de la zone."
-    )
-    body = (
-        f"{phase_label} Fibonacci sur {pair} en M5.\\n"
-        f"Direction envisagée : {direction_label}.\\n"
-        f"Zone Fibonacci 50–61,8 % : {zone_low:.5f} à {zone_high:.5f}.\\n"
-        f"Prix observé : {price:.5f}.\\n"
-        f"{phase_detail}\\n"
-        f"Dernière chandelle clôturée : {candle_time}.\\n"
-        f"Contexte M30 : {bias}. {m30_note}\\n\\n"
-        "ALERTE DE SURVEILLANCE UNIQUEMENT — CE N'EST PAS UN SIGNAL D'ENTRÉE.\\n"
-        "Attendre le rejet, la cassure et les confirmations habituelles. "
-        "Ne pas entrer sur la base de ce courriel. Aucun ordre automatique."
-    )
-    append_alert_history({
-        "Heure alerte": now_text,
-        "Heure chandelle": candle_time,
-        "Instrument": pair,
-        "Timeframe": timeframe,
-        "Direction": direction_label,
-        "Etat": f"SURVEILLANCE — {alert_phase} FIBONACCI",
-        "Zone basse": zone_low,
-        "Zone haute": zone_high,
-        "Prix au signal": price,
-        "Mode Fibonacci": fib_mode,
-        "Notes": (
-            f"{phase_label}. Distance : {distance_to_zone:.5f}. "
-            f"Biais M30 : {bias}."
-        ),
-    })
-    if not mute_alerts:
-        play_voice_alert(
-            VOICE_STRONG_BULL if direction == "BULL" else VOICE_STRONG_BEAR
-        )
-    if email_alerts_enabled:
-        sent, status = send_email_alert(subject, body)
-        if not sent:
-            st.warning(status)
-
-    st.info(
-        f"🔎 {pair} M5 : {phase_label.lower()} — "
-        f"surveillance {direction_label}; aucune entrée autorisée."
-    )
-    st.session_state[alert_state_key] = signal_key
-
-
 def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, trade_plan):
     """Ouvre immédiatement un trade virtuel OPEN après confirmation et plan valide."""
     if setup.get("state") not in ("BULL_CONFIRMED", "BEAR_CONFIRMED"):
@@ -1048,15 +985,15 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
     subject = f"{'🟢 TRADE VIRTUEL ACHAT' if bullish else '🔴 TRADE VIRTUEL VENTE'} Fibonacci — {pair} {timeframe}"
     fmt = lambda value: f"{float(value):.5f}"
     body = (
-        f"TRADE VIRTUEL OUVERT — signal Fibonacci confirmé sur {pair} en {timeframe}.\\n"
-        f"Direction : {direction}.\\n"
-        f"Zone Fibonacci 50–61,8 % : {fmt(zone_low)} à {fmt(zone_high)}.\\n"
-        f"Entrée virtuelle : {fmt(trade_plan['entry'])}.\\n"
-        f"Stop-loss : {fmt(trade_plan['stop_loss'])}.\\n"
-        f"Take-profit : {fmt(trade_plan['take_profit'])}.\\n"
-        f"Ratio R/R : 1:{float(trade_plan['rr']):.2f}.\\n"
-        f"Prix observé au signal : {fmt(current_price)}.\\n"
-        f"Dernière chandelle clôturée : {candle_time}.\\n\\n"
+        f"TRADE VIRTUEL OUVERT — signal Fibonacci confirmé sur {pair} en {timeframe}.\n"
+        f"Direction : {direction}.\n"
+        f"Zone Fibonacci 50–61,8 % : {fmt(zone_low)} à {fmt(zone_high)}.\n"
+        f"Entrée virtuelle : {fmt(trade_plan['entry'])}.\n"
+        f"Stop-loss : {fmt(trade_plan['stop_loss'])}.\n"
+        f"Take-profit : {fmt(trade_plan['take_profit'])}.\n"
+        f"Ratio R/R : 1:{float(trade_plan['rr']):.2f}.\n"
+        f"Prix observé au signal : {fmt(current_price)}.\n"
+        f"Dernière chandelle clôturée : {candle_time}.\n\n"
         "Le trade est suivi virtuellement dans le tableau de bord. Aucun ordre OANDA n'est envoyé."
     )
     append_alert_history({
@@ -1101,7 +1038,7 @@ st.markdown(
       <div style="text-align:right;min-width:170px;">
         <div style="display:inline-block;padding:7px 13px;border-radius:30px;
           border:1px solid rgba(32,214,138,.45);background:rgba(32,214,138,.10);
-          color:#45e6a0;font-weight:700;font-size:13px;">● MODE SURVEILLANCE</div>
+          color:#45e6a0;font-weight:700;font-size:13px;">● SIGNAUX CONFIRMÉS UNIQUEMENT</div>
         <div style="color:#9bb9d8;font-size:12px;margin-top:7px;">{now_ny.strftime('%d %B %Y — %H:%M:%S')} NY&nbsp; • &nbsp;Actualisation 60 s</div>
       </div>
     </div>
@@ -1123,13 +1060,13 @@ summary[0].metric(
     "INSTRUMENTS SUIVIS", str(len(selected_pairs)),
     " • ".join(pair_labels.get(pair, pair) for pair in selected_pairs)
 )
-summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Analyse + exécution")
+summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Signaux indépendants")
 summary[2].metric("DONNÉES", "OANDA", "Actualisation automatique")
 summary[3].metric("MODE", "Surveillance", "Aucun ordre automatique")
 st.caption(
-    "Alertes de surveillance M5 à l’approche et au contact de la zone Fibonacci. "
-    "Le trade virtuel s’ouvre à la confirmation si le plan est valide et, sur M5, si le biais M30 est aligné. "
-    "Le suivi TP/SL est effectué sur les chandelles clôturées. Aucun ordre automatique n’est envoyé."
+    "Alertes uniquement lorsqu’un rebond Fibonacci est confirmé et qu’un plan de trade valide est disponible. "
+    "Le M30 et le M5 génèrent leurs propres signaux; le M5 est bloqué seulement si le biais M30 est opposé. "
+    "Chaque signal confirmé ouvre un trade virtuel suivi jusqu’au TP ou au SL. Aucun ordre réel n’est envoyé."
 )
 
 for config in instruments_config:
@@ -1169,7 +1106,7 @@ for config in instruments_config:
                 border-left:5px solid #35b6e8;margin-bottom:12px;">
                 <div style="color:#f4f7fb;font-size:20px;font-weight:700;">
                 {pair_labels.get(pair, pair)} <span style="color:#9fc5df;font-size:15px;">— {timeframe}</span>
-                </div><div style="color:#c6d5e4;font-size:12px;margin-top:3px;">SURVEILLANCE DU MARCHÉ</div>
+                </div><div style="color:#c6d5e4;font-size:12px;margin-top:3px;">ANALYSE DU MARCHÉ</div>
                 </div>""",
                 unsafe_allow_html=True
             )
@@ -1246,11 +1183,11 @@ for config in instruments_config:
                 "fib": None
             }
         else:
-            setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override)
+            setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override, timeframe=timeframe)
 
         if (timeframe == "M5" and setup.get("state") in ("BULL_CONFIRMED", "BEAR_CONFIRMED")):
             required_bias = "BULL" if setup["state"] == "BULL_CONFIRMED" else "BEAR"
-            if not m30_context or m30_context.get("bias") != required_bias:
+            if m30_context and m30_context.get("bias") in ("BULL", "BEAR") and m30_context.get("bias") != required_bias:
                 setup = {
                     **setup,
                     "state": "M30_FILTERED",
@@ -1267,9 +1204,6 @@ for config in instruments_config:
         trade_plan, trade_message = build_trade_plan(setup, current_price)
 
 
-        process_early_fibonacci_alert(
-            pair, timeframe, setup, candle_time, current_price, closed_df, m30_context
-        )
         process_fibonacci_alert(
             pair, timeframe, setup, candle_time, current_price, trade_plan
         )
@@ -1289,7 +1223,7 @@ for config in instruments_config:
             col3.metric("ADX M30", "N/D" if m30_context.get("adx") is None else f"{m30_context['adx']:.1f}")
             col4.metric("ADX M5", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
             st.caption(m30_context.get("details", ""))
-            st.caption("Filtre actif : une configuration M5 doit être dans le même sens que le biais M30.")
+            st.caption("Filtre M30 : une configuration M5 est bloquée seulement si le biais M30 est clairement opposé; un biais neutre ne bloque pas le signal.")
         else:
             col1, col2 = st.columns(2)
             col1.metric("ADX14", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
