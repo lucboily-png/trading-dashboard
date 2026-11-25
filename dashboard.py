@@ -157,7 +157,14 @@ def create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mo
     if not trade_plan or not setup.get("fib"):
         return False, "Aucun plan complet à enregistrer."
     fib = setup["fib"]
-    candle_iso = pd.Timestamp(candle_time.replace(" NY", "")).tz_localize("America/New_York").isoformat()
+    # Accepte une heure locale naive ou déjà timezone-aware sans provoquer
+    # l'erreur "Cannot localize tz-aware Timestamp".
+    candle_stamp = pd.Timestamp(str(candle_time).replace(" NY", ""))
+    if candle_stamp.tzinfo is None:
+        candle_stamp = candle_stamp.tz_localize("America/New_York")
+    else:
+        candle_stamp = candle_stamp.tz_convert("America/New_York")
+    candle_iso = candle_stamp.isoformat()
     signal_key = _signal_identity(pair, timeframe, fib, fib_mode.upper())
     signal_time_iso = datetime.now(pytz.UTC).isoformat()
     payload = {
@@ -954,6 +961,11 @@ def build_trade_plan(setup, current_price, min_rr=1.5, stop_buffer_atr=0.20):
 
     if fib["direction"] == "BEAR":
         stop = zone_high + buffer
+        # Une vente limite au milieu de la zone n'est pertinente que si le
+        # prix est encore sous l'entrée. Sinon, le marché a déjà rejoint ou
+        # dépassé le niveau : ne pas créer un PENDING artificiel.
+        if live >= entry:
+            return None, "Entrée vente dépassée : le prix est déjà au niveau ou au-dessus de l'entrée limite. Attendre une nouvelle configuration."
         if live <= target:
             return None, "Signal trop tardif : l'objectif est déjà atteint. Ne pas poursuivre le prix."
         if live >= stop:
@@ -963,6 +975,10 @@ def build_trade_plan(setup, current_price, min_rr=1.5, stop_buffer_atr=0.20):
         risk, reward, side = stop - entry, entry - target, "VENTE"
     else:
         stop = zone_low - buffer
+        # Même protection pour un achat : éviter un ordre limite au-dessus
+        # du marché lorsque le prix a déjà traversé le niveau d'entrée.
+        if live <= entry:
+            return None, "Entrée achat dépassée : le prix est déjà au niveau ou sous l'entrée limite. Attendre une nouvelle configuration."
         if live >= target:
             return None, "Signal trop tardif : l'objectif est déjà atteint. Ne pas poursuivre le prix."
         if live <= stop:
