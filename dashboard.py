@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from email.mime.text import MIMEText
 
-st.set_page_config(page_title="Trading Monitor - Fibonacci Alerts", layout="wide")
+st.set_page_config(page_title="Trading Monitor - Fibonacci & FVG", layout="wide")
 st_autorefresh(interval=60 * 1000, key="refresh")
 
 
@@ -157,14 +157,7 @@ def create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mo
     if not trade_plan or not setup.get("fib"):
         return False, "Aucun plan complet à enregistrer."
     fib = setup["fib"]
-    # Accepte une heure locale naive ou déjà timezone-aware sans provoquer
-    # l'erreur "Cannot localize tz-aware Timestamp".
-    candle_stamp = pd.Timestamp(str(candle_time).replace(" NY", ""))
-    if candle_stamp.tzinfo is None:
-        candle_stamp = candle_stamp.tz_localize("America/New_York")
-    else:
-        candle_stamp = candle_stamp.tz_convert("America/New_York")
-    candle_iso = candle_stamp.isoformat()
+    candle_iso = pd.Timestamp(candle_time.replace(" NY", "")).tz_localize("America/New_York").isoformat()
     signal_key = _signal_identity(pair, timeframe, fib, fib_mode.upper())
     signal_time_iso = datetime.now(pytz.UTC).isoformat()
     payload = {
@@ -436,22 +429,7 @@ st.sidebar.caption(
     "Les deux emplacements libres peuvent servir à ajouter BTC/USD ou un autre timeframe."
 )
 
-mute_alerts = st.sidebar.checkbox("Désactiver les alertes vocales", value=False)
-email_alerts_enabled = st.sidebar.checkbox("Activer les alertes par courriel", value=True)
-
-st.sidebar.subheader("💰 Calculateur gains/pertes")
-capital = st.sidebar.number_input("Capital ($)", value=500.0, min_value=0.0)
-risk_percent = st.sidebar.number_input("Risque (%)", value=2.0, min_value=0.0)
-leverage = st.sidebar.number_input("Levier", value=50, min_value=1)
-rr = st.sidebar.number_input("RR", value=3.0, min_value=0.1)
-risk_amount = capital * (risk_percent / 100)
-potential_gain = risk_amount * rr
-exposure = capital * leverage
-st.sidebar.write(f"Risque/trade : **{risk_amount:.2f} $**")
-st.sidebar.write(f"Gain potentiel : **{potential_gain:.2f} $**")
-st.sidebar.write(f"Exposition théorique : **{exposure:,.0f} $**")
-show_emas = st.sidebar.checkbox("Afficher les EMA sur le graphique", value=True)
-st.sidebar.caption("Les alertes reposent sur le dernier Fibonacci valide, pas sur les EMA.")
+st.sidebar.caption("Mode analyse visuelle : Fibonacci automatique ou manuel et FVG associé. Aucun signal ni ordre n’est généré.")
 
 
 # OANDA DATA
@@ -674,6 +652,45 @@ def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
         "atr": atr,
     }, "Dernier swing confirmé et Fibonacci valide."
 
+
+
+def find_related_fvg(df, fib):
+    """Repère le FVG non entièrement comblé le plus récent dans le swing Fibonacci."""
+    if fib is None or df is None or len(df) < 3:
+        return None
+    data = df.reset_index(drop=True)
+    start = max(2, int(fib["origin"]["index"]))
+    end = min(len(data) - 1, int(fib["endpoint"]["index"]))
+    direction = fib["direction"]
+    candidates = []
+    for i in range(start, end + 1):
+        # FVG trois chandelles : espace entre la première et la troisième.
+        if direction == "BULL":
+            lower = float(data.iloc[i - 2]["high"])
+            upper = float(data.iloc[i]["low"])
+            valid = lower < upper
+        else:
+            lower = float(data.iloc[i]["high"])
+            upper = float(data.iloc[i - 2]["low"])
+            valid = lower < upper
+        if valid:
+            candidates.append({
+                "direction": direction, "low": lower, "high": upper,
+                "start_time": data.iloc[i - 2]["time"],
+                "formed_time": data.iloc[i]["time"],
+                "index": i,
+            })
+    # Le plus récent FVG du sens du swing qui n'a pas été entièrement traversé.
+    for gap in reversed(candidates):
+        later = data.iloc[gap["index"] + 1:]
+        if direction == "BULL":
+            fully_filled = (not later.empty) and float(later["low"].min()) <= gap["low"]
+        else:
+            fully_filled = (not later.empty) and float(later["high"].max()) >= gap["high"]
+        if not fully_filled:
+            gap["status"] = "NON COMBLÉ"
+            return gap
+    return None
 
 
 def build_manual_fibonacci(df, high_time, high_price, low_time, low_price):
@@ -961,11 +978,6 @@ def build_trade_plan(setup, current_price, min_rr=1.5, stop_buffer_atr=0.20):
 
     if fib["direction"] == "BEAR":
         stop = zone_high + buffer
-        # Une vente limite au milieu de la zone n'est pertinente que si le
-        # prix est encore sous l'entrée. Sinon, le marché a déjà rejoint ou
-        # dépassé le niveau : ne pas créer un PENDING artificiel.
-        if live >= entry:
-            return None, "Entrée vente dépassée : le prix est déjà au niveau ou au-dessus de l'entrée limite. Attendre une nouvelle configuration."
         if live <= target:
             return None, "Signal trop tardif : l'objectif est déjà atteint. Ne pas poursuivre le prix."
         if live >= stop:
@@ -975,10 +987,6 @@ def build_trade_plan(setup, current_price, min_rr=1.5, stop_buffer_atr=0.20):
         risk, reward, side = stop - entry, entry - target, "VENTE"
     else:
         stop = zone_low - buffer
-        # Même protection pour un achat : éviter un ordre limite au-dessus
-        # du marché lorsque le prix a déjà traversé le niveau d'entrée.
-        if live <= entry:
-            return None, "Entrée achat dépassée : le prix est déjà au niveau ou sous l'entrée limite. Attendre une nouvelle configuration."
         if live >= target:
             return None, "Signal trop tardif : l'objectif est déjà atteint. Ne pas poursuivre le prix."
         if live <= stop:
@@ -1150,14 +1158,10 @@ summary[0].metric(
     "INSTRUMENTS SUIVIS", str(len(selected_pairs)),
     " • ".join(pair_labels.get(pair, pair) for pair in selected_pairs)
 )
-summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Signaux indépendants")
+summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Analyse visuelle")
 summary[2].metric("DONNÉES", "OANDA", "Actualisation automatique")
-summary[3].metric("MODE", "Surveillance", "Aucun ordre automatique")
-st.caption(
-    "Alertes uniquement lorsqu’un rebond Fibonacci est confirmé et qu’un plan de trade valide est disponible. "
-    "Le M30 et le M5 génèrent leurs propres signaux; le M5 est bloqué seulement si le biais M30 est opposé. "
-    "Chaque signal confirmé crée un ordre limite virtuel; le trade ne s'ouvre qu'au retour du prix à l'entrée. Aucun ordre réel n’est envoyé."
-)
+summary[3].metric("MODE", "Analyse", "Décision manuelle")
+st.caption("Le dashboard affiche les swings Fibonacci confirmés, les niveaux 0 / 0,5 / 1 et le FVG non comblé associé. L’analyse et les décisions d’entrée restent entièrement manuelles.")
 
 for config in instruments_config:
     pair = config["pair"]
@@ -1176,14 +1180,7 @@ for config in instruments_config:
             st.warning(f"Aucune chandelle clôturée disponible pour {pair}.")
             continue
 
-        if supabase_configured():
-            try:
-                monitor_virtual_trades(pair, timeframe, closed_df)
-            except Exception as exc:
-                st.warning(f"Erreur Supabase — suivi des trades virtuels ({pair}) : {exc}")
-
         df = add_indicators(closed_df)
-        m30_context = get_m30_market_context(pair) if timeframe in ("M5", "M30") else None
         # Utilise la dernière chandelle reçue (potentiellement en formation) comme prix courant.
         # Cela évite une requête M1 OANDA supplémentaire pour chaque instrument.
         current_price = float(raw_df.iloc[-1]["close"])
@@ -1265,104 +1262,42 @@ for config in instruments_config:
                 st.warning(manual_status)
 
         if fib_mode == "Manuel" and fib_override is None:
-            setup = {
-                "state": "WAIT",
-                "label": "⚪ Fibonacci manuel à corriger",
-                "color": "gray",
-                "details": "Aucun signal calculé : vérifie les deux chandelles et les prix des ancrages manuels.",
-                "fib": None
-            }
+            fib = None
+            fib_message = manual_status
         else:
-            setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override, timeframe=timeframe)
+            fib, fib_message = (fib_override, "Fibonacci manuel actif.") if fib_override is not None else find_last_fibonacci(df)
 
-        if setup.get("state") in ("BULL_CONFIRMED", "BEAR_CONFIRMED") and m30_context:
-            required_bias = "BULL" if setup["state"] == "BULL_CONFIRMED" else "BEAR"
-            context_bias = m30_context.get("bias", "NEUTRAL")
-            # M30 : filtre strict, tendance EMA/DI ET structure doivent confirmer.
-            # M5 : on conserve le comportement antérieur et on bloque seulement
-            # lorsqu'un biais M30 clairement opposé est établi.
-            should_block = (
-                (timeframe == "M30" and context_bias != required_bias)
-                or (timeframe == "M5" and context_bias in ("BULL", "BEAR")
-                    and context_bias != required_bias)
-            )
-            if should_block:
-                if timeframe == "M30":
-                    filter_label = "⚪ SIGNAL M30 BLOQUÉ — TENDANCE / STRUCTURE NON ALIGNÉES"
-                    filter_state = "M30_FILTERED"
-                    filter_reason = "Filtre M30 strict : le signal Fibonacci doit être dans le même sens que la tendance ET la structure. "
-                else:
-                    filter_label = "⚪ CONFIGURATION M5 BLOQUÉE — CONTEXTE M30 OPPOSÉ"
-                    filter_state = "M30_FILTERED"
-                    filter_reason = "Filtre M30 : la configuration M5 est opposée au biais directeur. "
-                setup = {
-                    **setup,
-                    "state": filter_state,
-                    "label": filter_label,
-                    "color": "gray",
-                    "details": (setup.get("details", "") + " " + filter_reason
-                                + m30_context.get("details", "Contexte M30 indisponible.")
-                                + " Aucun trade virtuel n'est créé.")
-                }
-
+        setup = {
+            "state": "VISUAL" if fib else "WAIT",
+            "label": ("FIBONACCI HAUSSIER" if fib and fib["direction"] == "BULL" else
+                      "FIBONACCI BAISSIER" if fib else "EN ATTENTE D’UN SWING CONFIRMÉ"),
+            "color": "#20d68a" if fib and fib["direction"] == "BULL" else
+                     "#ff6b78" if fib else "#aab8c8",
+            "details": fib_message,
+            "fib": fib,
+        }
+        fvg = find_related_fvg(df, fib) if fib else None
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
-        trade_plan, trade_message = build_trade_plan(setup, current_price)
-
-
-        process_fibonacci_alert(
-            pair, timeframe, setup, candle_time, current_price, trade_plan
-        )
 
         st.markdown(
             f"<h4 style='color:{setup['color']};'>{setup['label']}</h4>",
             unsafe_allow_html=True
         )
-        st.write(setup["details"])
-        st.caption(f"Signal calculé sur la dernière chandelle clôturée : {candle_time}")
-
-        if timeframe in ("M5", "M30") and m30_context:
-            context_label = {"BULL": "HAUSSIER", "BEAR": "BAISSIER", "NEUTRAL": "NEUTRE"}.get(m30_context["bias"], "N/D")
-            structure_label = {"BULL": "HAUSSIÈRE", "BEAR": "BAISSIÈRE", "NEUTRAL": "INDÉCISE"}.get(m30_context.get("structure_bias", "NEUTRAL"), "N/D")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("BIAIS M30 VALIDÉ", context_label)
-            col2.metric("STRUCTURE M30", structure_label)
-            col3.metric("FORCE M30", m30_context.get("strength", "N/D"))
-            col4.metric("ADX M30", "N/D" if m30_context.get("adx") is None else f"{m30_context['adx']:.1f}")
-            st.caption(m30_context.get("details", ""))
-            if timeframe == "M30":
-                st.caption("Filtre M30 strict : un trade n'est permis que si les EMA/DI et les sommets/creux confirment la même direction.")
+        st.caption(f"Dernière chandelle clôturée : {candle_time}")
+        if fib:
+            fib_col1, fib_col2, fib_col3 = st.columns(3)
+            fib_col1.metric("NIVEAU 0 · EXTRÉMITÉ", f"{float(fib['endpoint']['price']):,.{price_decimals}f}")
+            fib_col2.metric("NIVEAU 0,5 · MILIEU", f"{float(fib['levels'][0.5]):,.{price_decimals}f}")
+            fib_col3.metric("NIVEAU 1 · ORIGINE", f"{float(fib['origin']['price']):,.{price_decimals}f}")
+            if fvg:
+                st.info(
+                    f"FVG {('HAUSSIER' if fvg['direction'] == 'BULL' else 'BAISSIER')} · {fvg['status']}  |  "
+                    f"Zone : {fvg['low']:,.{price_decimals}f} à {fvg['high']:,.{price_decimals}f}"
+                )
             else:
-                st.caption("Filtre M5 : seul un biais M30 clairement opposé bloque le signal; un biais neutre reste autorisé.")
+                st.caption("Aucun FVG non comblé correspondant au swing actuel n’a été détecté.")
         else:
-            col1, col2 = st.columns(2)
-            col1.metric("ADX14", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
-            col2.metric("Fibonacci", "Valide" if setup.get("fib") else "En attente")
-        if setup.get("fib"):
-            fib = setup["fib"]
-            zone_name = setup.get("zone_name", "ZONE DE RETRACEMENT")
-            st.write(f"**{zone_name} Fibonacci 50–61,8 % :** {fib['zone_low']:.5f} – {fib['zone_high']:.5f}")
-            st.write(f"**Origine du swing :** {fib['origin']['price']:.5f}  |  **Extrémité :** {fib['endpoint']['price']:.5f}")
-
-        st.markdown("#### Plan de trade Fibonacci")
-        if trade_plan:
-            st.info(
-                f"ORDRE LIMITE INDICATIF {trade_plan['side']} — "
-                f"R/R 1:{trade_plan['rr']:.2f} — ATTENDRE LE RETOUR DU PRIX"
-            )
-            plan_c1, plan_c2, plan_c3 = st.columns(3)
-            plan_c1.metric("Entrée limite (milieu de zone)", f"{trade_plan['entry']:.5f}")
-            plan_c2.metric("Stop-loss", f"{trade_plan['stop_loss']:.5f}")
-            plan_c3.metric("Take-profit", f"{trade_plan['take_profit']:.5f}")
-            st.caption(
-                f"Entrée au milieu de la zone Fibonacci : ne pas entrer au marché. "
-                f"Le trade virtuel s'ouvre seulement si le prix revient à l'entrée limite. "
-                f"SL au-delà de la zone avec une marge de 0,20 ATR; TP à l'extrémité du swing. Risque : "
-                f"{trade_plan['risk_distance']:.5f} | Récompense : "
-                f"{trade_plan['reward_distance']:.5f}. "
-                "À valider manuellement; aucun ordre n'est envoyé."
-            )
-        else:
-            st.info(trade_message)
+            st.info(fib_message)
 
         # CHART
         fig = make_subplots(
@@ -1386,6 +1321,16 @@ for config in instruments_config:
             close_y.append(live_price)
 
         fig.add_trace(
+            go.Candlestick(
+                x=df["time"], open=df["open"], high=df["high"],
+                low=df["low"], close=df["close"], name="Chandelles OANDA",
+                increasing_line_color="#20b96b", decreasing_line_color="#ef5350",
+                increasing_fillcolor="#20b96b", decreasing_fillcolor="#ef5350",
+                whiskerwidth=0.5,
+            ), row=1, col=1
+        )
+
+        fig.add_trace(
             go.Scatter(
                 x=close_x,
                 y=close_y,
@@ -1396,47 +1341,54 @@ for config in instruments_config:
             row=1, col=1
         )
 
-        if show_emas:
-            for ema_name, ema_color, ema_dash in [
-                ("EMA50", "#35B6FF", "solid"),
-                ("EMA100", "#B8C7D9", "dash"),
-                ("EMA200", "#FFB454", "solid")
-            ]:
-                fig.add_trace(
-                    go.Scatter(x=df["time"], y=df[ema_name], name=ema_name,
-                               line=dict(color=ema_color, dash=ema_dash, width=2), hoverinfo="none"), row=1, col=1
-                )
         if setup.get("fib"):
             fib = setup["fib"]
             x0 = fib["origin"]["time"]
             x1 = live_time if live_time is not None else df["time"].iloc[-1]
-
-            # Affichage classique : seulement les niveaux 0, 0.5 et 1.
-            # Les calculs internes du setup (zone 50–61,8 %, signaux et plans)
-            # restent inchangés.
             visible_levels = [
-                (0.0, float(fib["endpoint"]["price"]), "Fibonacci 0", "#35B6FF", "solid", 2),
-                (0.5, float(fib["levels"][0.5]), "Fibonacci 0.5", "#FFC857", "solid", 3),
-                (1.0, float(fib["origin"]["price"]), "Fibonacci 1", "#42E8D4", "solid", 2),
+                (0.0, float(fib["endpoint"]["price"]), "0", "#35B6FF", 2),
+                (0.5, float(fib["levels"][0.5]), "0,5", "#FFC857", 2.5),
+                (1.0, float(fib["origin"]["price"]), "1", "#42E8D4", 2),
             ]
-
-            for ratio, level, level_name, fib_color, fib_dash, fib_width in visible_levels:
+            for ratio, level, level_name, fib_color, fib_width in visible_levels:
                 fig.add_trace(go.Scatter(
                     x=[x0, x1], y=[level, level], mode="lines",
-                    name=level_name,
-                    line=dict(color=fib_color, width=fib_width, dash=fib_dash),
-                    hoverinfo="none"
+                    name=f"Fibonacci {level_name} · {level:,.{price_decimals}f}",
+                    line=dict(color=fib_color, width=fib_width),
+                    hovertemplate=f"Fibonacci {level_name}<br>Prix: %{{y:,.{price_decimals}f}}<extra></extra>"
                 ), row=1, col=1)
+                fig.add_annotation(
+                    x=x1, y=level, xref="x", yref="y",
+                    text=f"{level_name} · {level:,.{price_decimals}f}",
+                    showarrow=False, xanchor="left", xshift=7,
+                    font=dict(color=fib_color, size=11),
+                    bgcolor="rgba(7,20,38,0.78)", borderpad=2,
+                )
+            if fvg:
+                fvg_color = "rgba(32,214,138,0.22)" if fvg["direction"] == "BULL" else "rgba(255,91,110,0.22)"
+                fvg_line = "#20d68a" if fvg["direction"] == "BULL" else "#ff5b6e"
+                fig.add_shape(
+                    type="rect", xref="x", yref="y",
+                    x0=fvg["start_time"], x1=x1,
+                    y0=fvg["low"], y1=fvg["high"],
+                    fillcolor=fvg_color, line=dict(color=fvg_line, width=1.4),
+                    layer="below",
+                )
+                fig.add_annotation(
+                    x=fvg["formed_time"], y=fvg["high"], xref="x", yref="y",
+                    text=f"FVG {fvg['low']:,.{price_decimals}f} – {fvg['high']:,.{price_decimals}f}",
+                    showarrow=False, yshift=12, xanchor="left",
+                    font=dict(color=fvg_line, size=10),
+                    bgcolor="rgba(7,20,38,0.78)", borderpad=2,
+                )
             if fib.get("manual"):
                 fig.add_trace(go.Scatter(
                     x=[fib["origin"]["time"], fib["endpoint"]["time"]],
                     y=[fib["origin"]["price"], fib["endpoint"]["price"]],
-                    mode="markers+text",
-                    text=["Ancrage 1", "Ancrage 0"],
+                    mode="markers+text", text=["Origine (1)", "Extrémité (0)"],
                     textposition="top center",
                     marker=dict(size=11, color="white", line=dict(color="black", width=2)),
                     name="Ancrages manuels",
-                    hoverinfo="none"
                 ), row=1, col=1)
 
         fig.add_trace(
@@ -1545,399 +1497,6 @@ for config in instruments_config:
         st.error(f"Erreur pour {pair} ({timeframe}) : {exc}")
 
 
-# SUIVI DES TRADES VIRTUELS SUPABASE
+
 st.markdown("---")
-st.subheader("📊 Suivi des trades virtuels Fibonacci")
-if not supabase_configured():
-    st.warning("Connexion Supabase non disponible. Vérifie les deux secrets dans Streamlit.")
-else:
-    try:
-        virtual_trades = load_virtual_trade_stats()
-        virtual_df = pd.DataFrame(virtual_trades)
-        if virtual_df.empty:
-            st.info("Aucun trade virtuel enregistré pour le moment.")
-        else:
-            counts = virtual_df["status"].value_counts()
-            pending_count = int(counts.get("PENDING", 0))
-            opened = int(counts.get("OPEN", 0))
-            wins = int(counts.get("WIN", 0))
-            losses = int(counts.get("LOSS", 0))
-            ambiguous = int(counts.get("AMBIGUOUS", 0))
-            expired = int(counts.get("EXPIRED", 0))
-            completed = wins + losses
-            win_rate = (wins / completed * 100) if completed else 0.0
-
-            # Conversion des résultats en R vers des dollars théoriques.
-            # Le risque utilisé est celui configuré dans la barre latérale.
-            risk_per_trade = risk_amount
-            virtual_df["result_r"] = pd.to_numeric(
-                virtual_df["result_r"], errors="coerce"
-            )
-            closed_mask = virtual_df["status"].isin(["WIN", "LOSS"])
-            virtual_df["pnl_usd"] = 0.0
-            virtual_df.loc[closed_mask, "pnl_usd"] = (
-                virtual_df.loc[closed_mask, "result_r"] * risk_per_trade
-            )
-            # Les configurations en attente, trades ouverts, ambigus et expirés ne sont pas inclus au P&L réalisé.
-            virtual_df.loc[~closed_mask, "pnl_usd"] = float("nan")
-
-            closed_df = virtual_df.loc[closed_mask].copy()
-            gross_profit = float(closed_df.loc[closed_df["pnl_usd"] > 0, "pnl_usd"].sum())
-            gross_loss = abs(float(closed_df.loc[closed_df["pnl_usd"] < 0, "pnl_usd"].sum()))
-            net_profit = gross_profit - gross_loss
-            profit_factor = gross_profit / gross_loss if gross_loss > 0 else (
-                float("inf") if gross_profit > 0 else 0.0
-            )
-            average_trade = net_profit / completed if completed else 0.0
-            return_pct = (net_profit / capital * 100) if capital > 0 else 0.0
-
-            stat_cols = st.columns(6)
-            stat_cols[0].metric("Configurations en attente", pending_count)
-            stat_cols[1].metric("Trades ouverts", opened)
-            stat_cols[2].metric("Gagnants", wins)
-            stat_cols[3].metric("Perdants", losses)
-            stat_cols[4].metric("Taux de réussite", f"{win_rate:.1f}%" if completed else "N/D")
-            stat_cols[5].metric("Ambigus / expirés", f"{ambiguous} / {expired}")
-
-            # Semaine de trading : dimanche 17:00 au vendredi 17:00,
-            # selon l'heure de Québec (America/Toronto).
-            closed_df["_close_local"] = pd.to_datetime(
-                closed_df["close_time"], errors="coerce", utc=True
-            ).dt.tz_convert("America/Toronto")
-            now_local = pd.Timestamp.now(tz="America/Toronto")
-
-            # Repère le dimanche 17:00 le plus récent.
-            days_since_sunday = (now_local.weekday() + 1) % 7
-            week_start = (
-                now_local.normalize()
-                - pd.Timedelta(days=days_since_sunday)
-                + pd.Timedelta(hours=17)
-            )
-            if now_local < week_start:
-                week_start -= pd.Timedelta(days=7)
-
-            # La séance hebdomadaire se termine le vendredi à 17:00.
-            week_end = week_start + pd.Timedelta(days=5)
-            week_df = closed_df.loc[
-                (closed_df["_close_local"] >= week_start)
-                & (closed_df["_close_local"] < week_end)
-            ].copy()
-
-            week_trades = len(week_df)
-            week_wins = int((week_df["status"] == "WIN").sum())
-            week_losses = int((week_df["status"] == "LOSS").sum())
-            week_completed = week_wins + week_losses
-            week_win_rate = (week_wins / week_completed * 100) if week_completed else 0.0
-            week_net_usd = float(week_df["pnl_usd"].sum()) if week_trades else 0.0
-            week_net_r = float(week_df["result_r"].sum()) if week_trades else 0.0
-            week_gross_profit = float(week_df.loc[week_df["pnl_usd"] > 0, "pnl_usd"].sum())
-            week_gross_loss = abs(float(week_df.loc[week_df["pnl_usd"] < 0, "pnl_usd"].sum()))
-            week_pf = (
-                week_gross_profit / week_gross_loss if week_gross_loss > 0
-                else (float("inf") if week_gross_profit > 0 else 0.0)
-            )
-
-            st.markdown("#### 💹 Tableau de performance")
-            st.caption(
-                f"Résultats réalisés uniquement · Risque simulé de {risk_per_trade:.2f} $ par trade "
-                f"({risk_percent:.2f} % du capital configuré de {capital:.2f} $). "
-                "Les trades en attente, ouverts, ambigus et expirés ne sont pas inclus dans le profit net."
-            )
-
-            def performance_panel(title, subtitle, net_usd, net_r, winrate, trade_count,
-                                  wins_count, losses_count, factor, accent):
-                net_color = "#36d399" if net_usd >= 0 else "#ff6b7a"
-                factor_text = f"{factor:.2f}" if factor != float("inf") else "∞"
-                return f"""
-                <div style="
-                    background:linear-gradient(145deg, #17263b 0%, #101b2b 100%);
-                    border:1px solid rgba(148,163,184,.20);
-                    border-top:3px solid {accent};
-                    border-radius:16px;padding:19px 20px 17px;
-                    box-shadow:0 8px 24px rgba(0,0,0,.16);min-height:210px;">
-                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
-                    <div>
-                      <div style="font-size:17px;font-weight:750;color:#f3f6fb;">{title}</div>
-                      <div style="font-size:11px;color:#9eafc5;margin-top:3px;">{subtitle}</div>
-                    </div>
-                    <div style="font-size:10px;letter-spacing:1px;text-transform:uppercase;
-                                color:{accent};border:1px solid {accent}55;border-radius:20px;
-                                padding:5px 9px;font-weight:700;">{trade_count} trades</div>
-                  </div>
-                  <div style="margin-top:20px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">
-                    <span style="font-size:32px;line-height:1.1;font-weight:800;color:{net_color};">
-                      {net_usd:+,.2f} $
-                    </span>
-                    <span style="font-size:14px;font-weight:700;color:{net_color};">{net_r:+.2f} R</span>
-                  </div>
-                  <div style="height:1px;background:rgba(148,163,184,.17);margin:17px 0 13px;"></div>
-                  <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">
-                    <div>
-                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Réussite</div>
-                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">{winrate:.1f}%</div>
-                    </div>
-                    <div>
-                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Gagnants / pertes</div>
-                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">
-                        <span style="color:#36d399;">{wins_count}</span>
-                        <span style="color:#718096;"> / </span>
-                        <span style="color:#ff6b7a;">{losses_count}</span>
-                      </div>
-                    </div>
-                    <div>
-                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Profit factor</div>
-                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">{factor_text}</div>
-                    </div>
-                  </div>
-                </div>
-                """
-
-            cumulative_panel = performance_panel(
-                "Performance cumulative", "Depuis le premier trade clôturé",
-                net_profit, float(closed_df["result_r"].sum()) if completed else 0.0,
-                win_rate, completed, wins, losses, profit_factor, "#69a9ff"
-            )
-            week_label = (
-                f"Du dimanche {week_start.strftime('%d %b à 17 h')} "
-                f"au vendredi {week_end.strftime('%d %b à 17 h %Y')}"
-            )
-            weekly_panel = performance_panel(
-                "Cette semaine", week_label, week_net_usd, week_net_r,
-                week_win_rate, week_completed, week_wins, week_losses, week_pf, "#b69cff"
-            )
-
-            panel_cols = st.columns(2, gap="medium")
-            with panel_cols[0]:
-                st.markdown(cumulative_panel, unsafe_allow_html=True)
-            with panel_cols[1]:
-                st.markdown(weekly_panel, unsafe_allow_html=True)
-
-            st.caption(
-                f"Ensemble de l'historique : gains bruts {gross_profit:,.2f} $ · "
-                f"pertes brutes -{gross_loss:,.2f} $ · rendement du capital {return_pct:+.2f} % · "
-                f"gain/perte moyen {average_trade:+,.2f} $ par trade."
-            )
-
-            if completed:
-                equity_df = closed_df.copy()
-                equity_df["_sort_time"] = pd.to_datetime(
-                    equity_df["close_time"], errors="coerce", utc=True
-                )
-                equity_df = equity_df.sort_values("_sort_time")
-                equity_df["capital_simule"] = capital + equity_df["pnl_usd"].cumsum()
-                equity_df["trade_num"] = range(1, len(equity_df) + 1)
-
-                st.markdown("#### 📈 Évolution du capital simulé")
-                fig_equity = go.Figure()
-                fig_equity.add_trace(go.Scatter(
-                    x=equity_df["trade_num"],
-                    y=equity_df["capital_simule"],
-                    mode="lines+markers",
-                    name="Capital simulé",
-                    line=dict(width=3),
-                    hovertemplate="Trade %{x}<br>Capital : %{y:,.2f} $<extra></extra>"
-                ))
-                fig_equity.add_hline(
-                    y=capital, line_dash="dash", line_color="gray",
-                    annotation_text="Capital initial"
-                )
-                fig_equity.update_layout(
-                    height=320, template="plotly_dark",
-                    margin=dict(l=20, r=20, t=30, b=20),
-                    xaxis_title="Nombre de trades clôturés",
-                    yaxis_title="Capital ($)",
-                    showlegend=False
-                )
-                st.plotly_chart(fig_equity, width="stretch")
-
-                # GRAPHIQUES COMPLEMENTAIRES — statistiques issues des trades Supabase
-                st.markdown("#### 📊 Répartition des résultats et performance")
-
-                chart_col1, chart_col2 = st.columns(2)
-
-                # 1) Répartition des trades terminés
-                with chart_col1:
-                    outcome_values = {
-                        "Gagnants": wins,
-                        "Perdants": losses,
-                        "Ambigus": ambiguous,
-                        "Expirés": expired,
-                    }
-                    outcome_values = {
-                        label: value for label, value in outcome_values.items()
-                        if value > 0
-                    }
-                    if outcome_values:
-                        fig_outcomes = go.Figure(data=[go.Pie(
-                            labels=list(outcome_values.keys()),
-                            values=list(outcome_values.values()),
-                            hole=0.62,
-                            sort=False,
-                            textinfo="label+percent",
-                            marker=dict(
-                                colors=["#20d68a", "#ff5b6e", "#ffbf47", "#8294aa"],
-                                line=dict(color="#071426", width=2),
-                            ),
-                            hovertemplate="%{label}<br>%{value} trade(s)<br>%{percent}<extra></extra>",
-                        )])
-                        fig_outcomes.update_layout(
-                            title="Répartition des trades",
-                            height=340,
-                            template="plotly_dark",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            margin=dict(l=15, r=15, t=55, b=15),
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_outcomes, width="stretch")
-                    else:
-                        st.info("Aucun résultat terminé à répartir pour le moment.")
-
-                # 2) Résultat net par instrument, exprimé en R
-                with chart_col2:
-                    if not closed_df.empty and "instrument" in closed_df.columns:
-                        by_instrument = (
-                            closed_df.groupby("instrument", dropna=False)["result_r"]
-                            .sum()
-                            .sort_values()
-                            .reset_index()
-                        )
-                        by_instrument = by_instrument.dropna(subset=["result_r"])
-                        if not by_instrument.empty:
-                            fig_instruments = go.Figure(go.Bar(
-                                x=by_instrument["instrument"].astype(str),
-                                y=by_instrument["result_r"],
-                                marker=dict(
-                                    color=[
-                                        "#20d68a" if value >= 0 else "#ff5b6e"
-                                        for value in by_instrument["result_r"]
-                                    ]
-                                ),
-                                text=[f"{value:+.2f} R" for value in by_instrument["result_r"]],
-                                textposition="outside",
-                                hovertemplate="%{x}<br>Résultat : %{y:+.2f} R<extra></extra>",
-                            ))
-                            fig_instruments.update_layout(
-                                title="Performance par instrument",
-                                height=340,
-                                template="plotly_dark",
-                                paper_bgcolor="rgba(0,0,0,0)",
-                                plot_bgcolor="rgba(0,0,0,0)",
-                                margin=dict(l=15, r=15, t=55, b=35),
-                                yaxis_title="Résultat net (R)",
-                                xaxis_title="",
-                                showlegend=False,
-                                yaxis=dict(zeroline=True, zerolinecolor="#7890aa"),
-                            )
-                            st.plotly_chart(fig_instruments, width="stretch")
-                        else:
-                            st.info("Pas encore assez de résultats par instrument.")
-                    else:
-                        st.info("Les résultats par instrument apparaîtront après les premiers trades clôturés.")
-
-                # 3) Résultat hebdomadaire en R
-                if not closed_df.empty and "close_time" in closed_df.columns:
-                    weekly_df = closed_df.copy()
-                    weekly_df["_close_date"] = pd.to_datetime(
-                        weekly_df["close_time"], errors="coerce", utc=True
-                    )
-                    weekly_df["result_r"] = pd.to_numeric(
-                        weekly_df["result_r"], errors="coerce"
-                    )
-                    weekly_df = weekly_df.dropna(subset=["_close_date", "result_r"])
-                    if not weekly_df.empty:
-                        weekly_df["_week"] = (
-                            weekly_df["_close_date"]
-                            .dt.tz_convert("America/New_York")
-                            .dt.to_period("W")
-                            .astype(str)
-                        )
-                        weekly_results = (
-                            weekly_df.groupby("_week")["result_r"]
-                            .sum()
-                            .reset_index()
-                        )
-                        fig_weekly = go.Figure(go.Bar(
-                            x=weekly_results["_week"],
-                            y=weekly_results["result_r"],
-                            marker=dict(
-                                color=[
-                                    "#20d68a" if value >= 0 else "#ff5b6e"
-                                    for value in weekly_results["result_r"]
-                                ]
-                            ),
-                            text=[f"{value:+.2f} R" for value in weekly_results["result_r"]],
-                            textposition="outside",
-                            hovertemplate="Semaine %{x}<br>Résultat : %{y:+.2f} R<extra></extra>",
-                        ))
-                        fig_weekly.update_layout(
-                            title="Résultat par semaine",
-                            height=320,
-                            template="plotly_dark",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            margin=dict(l=20, r=20, t=55, b=45),
-                            xaxis_title="Semaine de clôture (heure de New York)",
-                            yaxis_title="Résultat net (R)",
-                            showlegend=False,
-                            yaxis=dict(zeroline=True, zerolinecolor="#7890aa"),
-                        )
-                        st.plotly_chart(fig_weekly, width="stretch")
-
-            display_columns = [
-                "created_at", "instrument", "timeframe", "direction", "fib_mode",
-                "entry_price", "stop_loss", "take_profit", "rr", "status",
-                "close_price", "close_time", "result_r", "pnl_usd", "notes"
-            ]
-            available_columns = [c for c in display_columns if c in virtual_df.columns]
-            st.dataframe(
-                virtual_df[available_columns],
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "pnl_usd": st.column_config.NumberColumn(
-                        "P&L simulé ($)", format="%.2f $"
-                    ),
-                    "result_r": st.column_config.NumberColumn(
-                        "Résultat (R)", format="%.2f R"
-                    ),
-                }
-            )
-            st.download_button(
-                "⬇️ Télécharger l'historique des trades virtuels (CSV)",
-                data=virtual_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"trades_virtuels_{datetime.now(pytz.timezone('America/New_York')).strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-    except Exception as exc:
-        st.error(f"Impossible de charger les trades virtuels depuis Supabase : {exc}")
-
-
-# RECENT ALERTS AND DOWNLOADABLE HISTORY
-st.markdown("---")
-st.subheader("🔔 Alertes Fibonacci récentes")
-recent_alerts = st.session_state.get("fib_new_alerts", [])
-if recent_alerts:
-    st.dataframe(pd.DataFrame(recent_alerts[::-1]), width="stretch", hide_index=True)
-else:
-    st.info("Aucune nouvelle alerte Fibonacci depuis l'ouverture du dashboard.")
-
-st.markdown("#### 📚 Journal complet des alertes")
-alert_history = load_alert_history()
-if not alert_history.empty:
-    st.caption(
-        f"{len(alert_history)} alerte(s) enregistrée(s) dans le journal local. "
-        "Les colonnes Résultat et Notes sont prévues pour ton analyse après coup."
-    )
-    st.dataframe(alert_history.iloc[::-1], width="stretch", hide_index=True)
-    csv_data = alert_history.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        label="⬇️ Télécharger le journal Fibonacci (CSV / Excel)",
-        data=csv_data,
-        file_name=f"journal_fibonacci_{datetime.now(pytz.timezone('America/New_York')).strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-else:
-    st.info("Le journal sera créé automatiquement à la première nouvelle alerte confirmée.")
+st.caption("Mode analyse visuelle activé : aucun courriel, signal automatique ou trade virtuel n’est déclenché. Les anciennes données Supabase et l’historique des alertes ne sont pas supprimés.")
