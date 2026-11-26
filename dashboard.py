@@ -1254,6 +1254,12 @@ for config in instruments_config:
                 key=f"focus_fib_chart_{pair}_{timeframe}",
                 help="Affiche surtout la fenêtre de recherche du swing au lieu de comprimer le Fibonacci dans tout l'historique."
             )
+            visible_candles = st.slider(
+                "NOMBRE DE CHANDELLES À AFFICHER",
+                min_value=15, max_value=100, value=35, step=5,
+                key=f"visible_candles_{pair}_{timeframe}",
+                help="Moins de chandelles visibles = corps plus larges et meilleure lecture, comme un zoom avant dans TradingView."
+            )
         fib_override = None
         if fib_mode == "Manuel":
             st.caption(
@@ -1374,7 +1380,8 @@ for config in instruments_config:
                 low=df["low"], close=df["close"], name="Chandelles OANDA",
                 increasing_line_color="#20b96b", decreasing_line_color="#ef5350",
                 increasing_fillcolor="#20b96b", decreasing_fillcolor="#ef5350",
-                whiskerwidth=0.5,
+                increasing_line_width=2, decreasing_line_width=2,
+                whiskerwidth=0.8,
             ), row=1, col=1
         )
 
@@ -1505,16 +1512,19 @@ for config in instruments_config:
                 font=dict(color="#F4F8FC")
             )
         )
-        if fib:
-            if focus_fib_chart:
-                # Cadre le graphique autour de la fenêtre récente utilisée pour
-                # détecter le swing. Un petit coussin à gauche conserve le contexte,
-                # tandis que la projection à droite laisse respirer les niveaux.
-                latest_chart_time = pd.Timestamp(live_time if live_time is not None else df["time"].iloc[-1])
-                focus_start = latest_chart_time - pd.Timedelta(hours=float(fib_lookback_hours) * 1.12)
-                fig.update_xaxes(range=[focus_start, chart_end])
-            else:
-                fig.update_xaxes(range=[df["time"].iloc[0], chart_end])
+        if focus_fib_chart:
+            # Le nombre de chandelles visibles contrôle directement leur largeur
+            # dans Plotly : on zoome sur les N dernières bougies au lieu de montrer
+            # toute la fenêtre de recherche du swing.
+            interval_minutes = {"M1": 1, "M5": 5, "M15": 15, "M30": 30,
+                                "H1": 60, "H4": 240, "D": 1440, "W": 10080}.get(timeframe, 5)
+            latest_chart_time = pd.Timestamp(live_time if live_time is not None else df["time"].iloc[-1])
+            candle_span = pd.Timedelta(minutes=interval_minutes * int(visible_candles))
+            focus_start = latest_chart_time - candle_span
+            right_padding = pd.Timedelta(minutes=interval_minutes * 3)
+            fig.update_xaxes(range=[focus_start, latest_chart_time + right_padding])
+        else:
+            fig.update_xaxes(range=[df["time"].iloc[0], chart_end])
         fig.update_xaxes(
             showgrid=True, gridcolor="rgba(76,115,153,0.20)",
             zeroline=False, showline=True, linecolor="#29445F",
