@@ -571,7 +571,7 @@ def add_indicators(df):
     return df
 
 
-def find_last_fibonacci(df, pivot_window=3, min_leg_atr=2.5, lookback_bars=200):
+def find_last_fibonacci(df, pivot_window=2, min_leg_atr=1.5, lookback_hours=2):
     """Détecte le swing majeur le plus pertinent dans la fenêtre récente.
 
     Au lieu de toujours retenir les deux derniers micro-pivots (qui peuvent
@@ -617,7 +617,18 @@ def find_last_fibonacci(df, pivot_window=3, min_leg_atr=2.5, lookback_bars=200):
     if pd.isna(atr) or atr <= 0:
         return None, "ATR indisponible : impossible de mesurer la taille du swing."
 
-    first_allowed = max(0, len(data) - lookback_bars)
+    times = pd.to_datetime(data["time"], errors="coerce")
+    latest_time = times.iloc[-1]
+    cutoff_time = latest_time - pd.Timedelta(hours=float(lookback_hours))
+    first_allowed = int(times.ge(cutoff_time).idxmax()) if times.ge(cutoff_time).any() else len(data) - 1
+    recent_count = len(data) - first_allowed
+    # En très petits timeframes, conserver assez de chandelles pour confirmer
+    # deux pivots; la fenêtre horaire demeure prioritaire.
+    if recent_count < max(8, pivot_window * 2 + 4):
+        return None, (
+            f"Pas assez de chandelles dans les {lookback_hours:g} dernières heures "
+            "pour confirmer un swing. Essaie une fenêtre un peu plus longue."
+        )
     candidates = []
     for origin, endpoint in zip(alternating[:-1], alternating[1:]):
         if origin["index"] < first_allowed or endpoint["index"] < first_allowed:
@@ -758,7 +769,7 @@ def evaluate_fibonacci_setup(
     """
     fib, fib_message = (
         (fib_override, "Fibonacci manuel actif.")
-        if fib_override is not None else find_last_fibonacci(df)
+        if fib_override is not None else find_last_fibonacci(df, lookback_hours=fib_lookback_hours)
     )
     if fib is None:
         return {
@@ -1222,6 +1233,21 @@ for config in instruments_config:
                     horizontal=True, key=f"fib_mode_{pair}_{timeframe}",
                     help="En mode manuel, choisis les chandelles du sommet et du creux, puis ajuste leurs prix."
                 )
+            look_col, height_col = st.columns([1, 1])
+            with look_col:
+                fib_lookback_hours = st.slider(
+                    "RECHERCHE DU SWING (HEURES)",
+                    min_value=1, max_value=6, value=2, step=1,
+                    key=f"fib_lookback_hours_{pair}_{timeframe}",
+                    help="Le Fibonacci automatique cherchera un mouvement confirmé dans cette période récente."
+                )
+            with height_col:
+                chart_height = st.slider(
+                    "HAUTEUR DU GRAPHIQUE",
+                    min_value=650, max_value=1200, value=900, step=50,
+                    key=f"chart_height_{pair}_{timeframe}",
+                    help="Augmente la hauteur pour agrandir le graphique verticalement, comme dans TradingView."
+                )
         fib_override = None
         if fib_mode == "Manuel":
             st.caption(
@@ -1279,7 +1305,7 @@ for config in instruments_config:
             fib = None
             fib_message = manual_status
         else:
-            fib, fib_message = (fib_override, "Fibonacci manuel actif.") if fib_override is not None else find_last_fibonacci(df)
+            fib, fib_message = (fib_override, "Fibonacci manuel actif.") if fib_override is not None else find_last_fibonacci(df, lookback_hours=fib_lookback_hours)
 
         setup = {
             "state": "VISUAL" if fib else "WAIT",
@@ -1318,7 +1344,7 @@ for config in instruments_config:
         # CHART
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.7, 0.3], vertical_spacing=0.05
+            row_heights=[0.82, 0.18], vertical_spacing=0.05
         )
 
         # Ligne Close des chandelles clôturées, prolongée jusqu'au prix actuel.
@@ -1456,7 +1482,7 @@ for config in instruments_config:
         )
         # Palette graphique harmonisée avec le thème bleu nuit du Dashboard.
         fig.update_layout(
-            height=700,
+            height=chart_height,
             template="plotly_dark",
             paper_bgcolor="#071426",
             plot_bgcolor="#091B30",
@@ -1550,7 +1576,7 @@ for config in instruments_config:
         }})();
         </script>
         """
-        components.html(panel_script, height=740, scrolling=False)
+        components.html(panel_script, height=chart_height + 40, scrolling=False)
 
     except Exception as exc:
         st.error(f"Erreur pour {pair} ({timeframe}) : {exc}")
