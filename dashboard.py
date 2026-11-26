@@ -1285,17 +1285,19 @@ for config in instruments_config:
         )
         st.caption(f"Dernière chandelle clôturée : {candle_time}")
         if fib:
-            fib_col1, fib_col2, fib_col3 = st.columns(3)
-            fib_col1.metric("NIVEAU 0 · EXTRÉMITÉ", f"{float(fib['endpoint']['price']):,.{price_decimals}f}")
-            fib_col2.metric("NIVEAU 0,5 · MILIEU", f"{float(fib['levels'][0.5]):,.{price_decimals}f}")
-            fib_col3.metric("NIVEAU 1 · ORIGINE", f"{float(fib['origin']['price']):,.{price_decimals}f}")
+            fib_col1, fib_col2, fib_col3, fvg_col = st.columns([1, 1, 1, 1.35])
+            fib_col1.metric("FIB 0 · EXTRÉMITÉ", f"{float(fib['endpoint']['price']):,.{price_decimals}f}")
+            fib_col2.metric("FIB 0,5 · MILIEU", f"{float(fib['levels'][0.5]):,.{price_decimals}f}")
+            fib_col3.metric("FIB 1 · ORIGINE", f"{float(fib['origin']['price']):,.{price_decimals}f}")
             if fvg:
-                st.info(
-                    f"FVG {('HAUSSIER' if fvg['direction'] == 'BULL' else 'BAISSIER')} · {fvg['status']}  |  "
-                    f"Zone : {fvg['low']:,.{price_decimals}f} à {fvg['high']:,.{price_decimals}f}"
+                fvg_side = "HAUSSIER" if fvg["direction"] == "BULL" else "BAISSIER"
+                fvg_col.metric(
+                    f"FVG {fvg_side}",
+                    f"{fvg['low']:,.{price_decimals}f} – {fvg['high']:,.{price_decimals}f}",
+                    "NON COMBLÉ"
                 )
             else:
-                st.caption("Aucun FVG non comblé correspondant au swing actuel n’a été détecté.")
+                fvg_col.metric("FVG ASSOCIÉ", "Non détecté", "Aucun gap valide dans ce swing")
         else:
             st.info(fib_message)
 
@@ -1345,6 +1347,44 @@ for config in instruments_config:
             fib = setup["fib"]
             x0 = fib["origin"]["time"]
             x1 = live_time if live_time is not None else df["time"].iloc[-1]
+            # Prolonge les niveaux dans l'espace libre à droite du graphique.
+            interval_minutes = {"M1": 1, "M5": 5, "M15": 15, "M30": 30,
+                                "H1": 60, "H4": 240, "D": 1440, "W": 10080}.get(timeframe, 5)
+            chart_end = pd.Timestamp(x1) + pd.Timedelta(minutes=interval_minutes * 8)
+            origin_price = float(fib["origin"]["price"])
+            endpoint_price = float(fib["endpoint"]["price"])
+            midpoint_price = float(fib["levels"][0.5])
+
+            # Fond discret du swing et zone de retracement, pour lire le Fib d'un coup d'œil.
+            fig.add_shape(
+                type="rect", xref="x", yref="y",
+                x0=x0, x1=chart_end,
+                y0=min(origin_price, endpoint_price),
+                y1=max(origin_price, endpoint_price),
+                fillcolor="rgba(53,182,255,0.055)",
+                line=dict(color="rgba(53,182,255,0.25)", width=1, dash="dot"),
+                layer="below",
+            )
+            fig.add_shape(
+                type="rect", xref="x", yref="y",
+                x0=x0, x1=chart_end,
+                y0=min(origin_price, midpoint_price),
+                y1=max(origin_price, midpoint_price),
+                fillcolor="rgba(255,200,87,0.075)",
+                line=dict(width=0),
+                layer="below",
+            )
+            # Diagonale reliant les deux ancrages du mouvement mesuré.
+            fig.add_trace(go.Scatter(
+                x=[fib["origin"]["time"], fib["endpoint"]["time"]],
+                y=[origin_price, endpoint_price],
+                mode="lines+markers",
+                name="Swing mesuré",
+                line=dict(color="#DCE8F5", width=2, dash="dash"),
+                marker=dict(size=8, color="#DCE8F5", line=dict(color="#071426", width=1)),
+                hovertemplate="Swing Fibonacci<br>Prix: %{y:,.5f}<extra></extra>",
+            ), row=1, col=1)
+
             visible_levels = [
                 (0.0, float(fib["endpoint"]["price"]), "0", "#35B6FF", 2),
                 (0.5, float(fib["levels"][0.5]), "0,5", "#FFC857", 2.5),
@@ -1358,28 +1398,31 @@ for config in instruments_config:
                     hovertemplate=f"Fibonacci {level_name}<br>Prix: %{{y:,.{price_decimals}f}}<extra></extra>"
                 ), row=1, col=1)
                 fig.add_annotation(
-                    x=x1, y=level, xref="x", yref="y",
-                    text=f"{level_name} · {level:,.{price_decimals}f}",
-                    showarrow=False, xanchor="left", xshift=7,
+                    x=chart_end, y=level, xref="x", yref="y",
+                    text=f"FIB {level_name}  ·  {level:,.{price_decimals}f}",
+                    showarrow=False, xanchor="left", xshift=5,
                     font=dict(color=fib_color, size=11),
-                    bgcolor="rgba(7,20,38,0.78)", borderpad=2,
+                    bgcolor="rgba(7,20,38,0.94)",
+                    bordercolor=fib_color, borderwidth=1, borderpad=4,
                 )
             if fvg:
                 fvg_color = "rgba(32,214,138,0.22)" if fvg["direction"] == "BULL" else "rgba(255,91,110,0.22)"
                 fvg_line = "#20d68a" if fvg["direction"] == "BULL" else "#ff5b6e"
                 fig.add_shape(
                     type="rect", xref="x", yref="y",
-                    x0=fvg["start_time"], x1=x1,
+                    x0=fvg["start_time"], x1=chart_end,
                     y0=fvg["low"], y1=fvg["high"],
-                    fillcolor=fvg_color, line=dict(color=fvg_line, width=1.4),
-                    layer="below",
+                    fillcolor=fvg_color, line=dict(color=fvg_line, width=2),
+                    layer="above",
                 )
                 fig.add_annotation(
                     x=fvg["formed_time"], y=fvg["high"], xref="x", yref="y",
-                    text=f"FVG {fvg['low']:,.{price_decimals}f} – {fvg['high']:,.{price_decimals}f}",
-                    showarrow=False, yshift=12, xanchor="left",
-                    font=dict(color=fvg_line, size=10),
-                    bgcolor="rgba(7,20,38,0.78)", borderpad=2,
+                    text=f"FVG {fvg['low']:,.{price_decimals}f} – {fvg['high']:,.{price_decimals}f} · NON COMBLÉ",
+                    showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.2,
+                    arrowcolor=fvg_line, ax=0, ay=-32, xanchor="left",
+                    font=dict(color=fvg_line, size=11),
+                    bgcolor="rgba(7,20,38,0.94)",
+                    bordercolor=fvg_line, borderwidth=1, borderpad=4,
                 )
             if fib.get("manual"):
                 fig.add_trace(go.Scatter(
@@ -1416,6 +1459,8 @@ for config in instruments_config:
                 font=dict(color="#F4F8FC")
             )
         )
+        if fib:
+            fig.update_xaxes(range=[df["time"].iloc[0], chart_end])
         fig.update_xaxes(
             showgrid=True, gridcolor="rgba(76,115,153,0.20)",
             zeroline=False, showline=True, linecolor="#29445F",
