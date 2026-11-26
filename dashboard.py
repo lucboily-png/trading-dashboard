@@ -571,11 +571,13 @@ def add_indicators(df):
     return df
 
 
-def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
-    """Trouve le dernier swing confirmé et construit son retracement Fibonacci.
+def find_last_fibonacci(df, pivot_window=3, min_leg_atr=2.5, lookback_bars=200):
+    """Détecte le swing majeur le plus pertinent dans la fenêtre récente.
 
-    Les pivots sont confirmés seulement après `pivot_window` chandelles à droite,
-    afin d'éviter d'utiliser un sommet/creux qui n'est pas encore établi.
+    Au lieu de toujours retenir les deux derniers micro-pivots (qui peuvent
+    réduire le Fibonacci à quelques pixels), compare les jambes confirmées
+    dans les dernières `lookback_bars` chandelles et retient la plus ample.
+    Les pivots restent confirmés avec `pivot_window` chandelles à droite.
     """
     data = df.reset_index(drop=True)
     if len(data) < max(40, pivot_window * 2 + 20):
@@ -595,7 +597,6 @@ def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
             pivots.append({"index": i, "type": "LOW", "price": low, "time": data.loc[i, "time"]})
 
     pivots.sort(key=lambda x: x["index"])
-    # Fusionne deux pivots consécutifs de même type en conservant l'extrême.
     alternating = []
     for pivot in pivots:
         if not alternating or alternating[-1]["type"] != pivot["type"]:
@@ -612,20 +613,33 @@ def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
     if len(alternating) < 2:
         return None, "Aucun mouvement haussier ou baissier confirmé détecté."
 
-    # Le dernier mouvement est formé par les deux derniers pivots confirmés.
-    origin, endpoint = alternating[-2], alternating[-1]
-    if origin["type"] == endpoint["type"]:
-        return None, "Le dernier swing n'est pas encore exploitable."
-
     atr = float(data.iloc[-1].get("ATR14", float("nan")))
-    leg_size = abs(endpoint["price"] - origin["price"])
-    if pd.isna(atr) or atr <= 0 or leg_size < min_leg_atr * atr:
-        return None, "Dernier mouvement trop faible pour produire un Fibonacci valide."
+    if pd.isna(atr) or atr <= 0:
+        return None, "ATR indisponible : impossible de mesurer la taille du swing."
 
-    bullish = origin["type"] == "LOW" and endpoint["type"] == "HIGH"
-    bearish = origin["type"] == "HIGH" and endpoint["type"] == "LOW"
-    if not (bullish or bearish):
-        return None, "Structure de swing non valide."
+    first_allowed = max(0, len(data) - lookback_bars)
+    candidates = []
+    for origin, endpoint in zip(alternating[:-1], alternating[1:]):
+        if origin["index"] < first_allowed or endpoint["index"] < first_allowed:
+            continue
+        if origin["type"] == endpoint["type"]:
+            continue
+        leg_size = abs(endpoint["price"] - origin["price"])
+        if leg_size < min_leg_atr * atr:
+            continue
+        bullish = origin["type"] == "LOW" and endpoint["type"] == "HIGH"
+        bearish = origin["type"] == "HIGH" and endpoint["type"] == "LOW"
+        if not (bullish or bearish):
+            continue
+        # Favorise les jambes réellement structurantes plutôt que les petits
+        # allers-retours récents. La taille est normalisée par l'ATR courant.
+        candidates.append((leg_size / atr, origin, endpoint, leg_size, bullish))
+
+    if not candidates:
+        return None, "Aucun swing suffisamment ample et confirmé dans la fenêtre récente."
+
+    # Le swing le plus ample dans la fenêtre donne une structure lisible.
+    _, origin, endpoint, leg_size, bullish = max(candidates, key=lambda item: item[0])
 
     if bullish:
         levels = {r: endpoint["price"] - leg_size * r for r in (0.382, 0.5, 0.618, 0.786)}
@@ -650,7 +664,7 @@ def find_last_fibonacci(df, pivot_window=3, min_leg_atr=1.5):
         "zone_high": zone_high,
         "leg_size": leg_size,
         "atr": atr,
-    }, "Dernier swing confirmé et Fibonacci valide."
+    }, "Swing majeur confirmé sélectionné automatiquement dans les dernières chandelles."
 
 
 
@@ -1350,7 +1364,7 @@ for config in instruments_config:
             # Prolonge les niveaux dans l'espace libre à droite du graphique.
             interval_minutes = {"M1": 1, "M5": 5, "M15": 15, "M30": 30,
                                 "H1": 60, "H4": 240, "D": 1440, "W": 10080}.get(timeframe, 5)
-            chart_end = pd.Timestamp(x1) + pd.Timedelta(minutes=interval_minutes * 8)
+            chart_end = pd.Timestamp(x1) + pd.Timedelta(minutes=interval_minutes * 24)
             origin_price = float(fib["origin"]["price"])
             endpoint_price = float(fib["endpoint"]["price"])
             midpoint_price = float(fib["levels"][0.5])
@@ -1361,8 +1375,8 @@ for config in instruments_config:
                 x0=x0, x1=chart_end,
                 y0=min(origin_price, endpoint_price),
                 y1=max(origin_price, endpoint_price),
-                fillcolor="rgba(53,182,255,0.055)",
-                line=dict(color="rgba(53,182,255,0.25)", width=1, dash="dot"),
+                fillcolor="rgba(53,182,255,0.12)",
+                line=dict(color="rgba(53,182,255,0.55)", width=2, dash="solid"),
                 layer="below",
             )
             fig.add_shape(
@@ -1370,7 +1384,7 @@ for config in instruments_config:
                 x0=x0, x1=chart_end,
                 y0=min(origin_price, midpoint_price),
                 y1=max(origin_price, midpoint_price),
-                fillcolor="rgba(255,200,87,0.075)",
+                fillcolor="rgba(255,200,87,0.16)",
                 line=dict(width=0),
                 layer="below",
             )
@@ -1394,16 +1408,16 @@ for config in instruments_config:
                 fig.add_trace(go.Scatter(
                     x=[x0, x1], y=[level, level], mode="lines",
                     name=f"Fibonacci {level_name} · {level:,.{price_decimals}f}",
-                    line=dict(color=fib_color, width=fib_width),
+                    line=dict(color=fib_color, width=3.5),
                     hovertemplate=f"Fibonacci {level_name}<br>Prix: %{{y:,.{price_decimals}f}}<extra></extra>"
                 ), row=1, col=1)
                 fig.add_annotation(
                     x=chart_end, y=level, xref="x", yref="y",
                     text=f"FIB {level_name}  ·  {level:,.{price_decimals}f}",
                     showarrow=False, xanchor="left", xshift=5,
-                    font=dict(color=fib_color, size=11),
+                    font=dict(color=fib_color, size=15, family="Arial Black"),
                     bgcolor="rgba(7,20,38,0.94)",
-                    bordercolor=fib_color, borderwidth=1, borderpad=4,
+                    bordercolor=fib_color, borderwidth=2, borderpad=7,
                 )
             if fvg:
                 fvg_color = "rgba(32,214,138,0.22)" if fvg["direction"] == "BULL" else "rgba(255,91,110,0.22)"
@@ -1412,15 +1426,15 @@ for config in instruments_config:
                     type="rect", xref="x", yref="y",
                     x0=fvg["start_time"], x1=chart_end,
                     y0=fvg["low"], y1=fvg["high"],
-                    fillcolor=fvg_color, line=dict(color=fvg_line, width=2),
+                    fillcolor=fvg_color, line=dict(color=fvg_line, width=3),
                     layer="above",
                 )
                 fig.add_annotation(
                     x=fvg["formed_time"], y=fvg["high"], xref="x", yref="y",
                     text=f"FVG {fvg['low']:,.{price_decimals}f} – {fvg['high']:,.{price_decimals}f} · NON COMBLÉ",
-                    showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.2,
+                    showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=2.2,
                     arrowcolor=fvg_line, ax=0, ay=-32, xanchor="left",
-                    font=dict(color=fvg_line, size=11),
+                    font=dict(color=fvg_line, size=15, family="Arial Black"),
                     bgcolor="rgba(7,20,38,0.94)",
                     bordercolor=fvg_line, borderwidth=1, borderpad=4,
                 )
