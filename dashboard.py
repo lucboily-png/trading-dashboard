@@ -16,7 +16,7 @@ from pathlib import Path
 from email.mime.text import MIMEText
 
 st.set_page_config(page_title="Trading Monitor - Fibonacci & FVG", layout="wide")
-st_autorefresh(interval=60 * 1000, key="refresh")
+st_autorefresh(interval=15 * 1000, key="refresh")
 
 
 # DESIGN V1 â prÃ©sentation uniquement (aucune rÃ¨gle de trading modifiÃ©e)
@@ -437,7 +437,7 @@ st.sidebar.caption("Une alerte indique une zone potentielle à surveiller, pas u
 
 
 # OANDA DATA
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def get_data(pair, granularity="M30", count=300):
     request = instruments.InstrumentsCandles(
         instrument=pair,
@@ -1382,17 +1382,21 @@ for config in instruments_config:
         # CHART — cadrage serré : peu de bougies, pleine largeur, grande échelle verticale.
         # On garde les données complètes pour le calcul du swing/FVG, mais on ne trace
         # que les dernières chandelles pour que les bougies et les niveaux occupent l'écran.
-        chart_df = df.tail(int(visible_candles)).copy()
+        # Le calcul Fibonacci reste basé sur les chandelles clôturées (df),
+        # mais le graphique affiche aussi la chandelle OANDA en formation.
+        chart_df = raw_df.tail(int(visible_candles)).copy()
+        chart_closed_df = chart_df[chart_df["complete"]].copy()
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True,
             row_heights=[0.94, 0.06], vertical_spacing=0.025
         )
 
         # Ligne Close des chandelles clôturées, prolongée jusqu'au prix actuel.
-        # Le dernier point correspond à la chandelle OANDA encore en formation.
+        # La chandelle OANDA en formation est tracée comme une vraie bougie
+        # ci-dessous; cette ligne Close sert seulement de repère de prix courant.
         live_time = None
-        close_x = chart_df["time"].tolist()
-        close_y = chart_df["close"].astype(float).tolist()
+        close_x = chart_closed_df["time"].tolist()
+        close_y = chart_closed_df["close"].astype(float).tolist()
 
         if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
             live_time = pd.to_datetime(
