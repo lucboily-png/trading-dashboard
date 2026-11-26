@@ -1244,10 +1244,16 @@ for config in instruments_config:
             with height_col:
                 chart_height = st.slider(
                     "HAUTEUR DU GRAPHIQUE",
-                    min_value=650, max_value=1200, value=900, step=50,
+                    min_value=750, max_value=1500, value=1100, step=50,
                     key=f"chart_height_{pair}_{timeframe}",
                     help="Augmente la hauteur pour agrandir le graphique verticalement, comme dans TradingView."
                 )
+            focus_fib_chart = st.checkbox(
+                "ZOOMER SUR LE FIBONACCI RÉCENT",
+                value=True,
+                key=f"focus_fib_chart_{pair}_{timeframe}",
+                help="Affiche surtout la fenêtre de recherche du swing au lieu de comprimer le Fibonacci dans tout l'historique."
+            )
         fib_override = None
         if fib_mode == "Manuel":
             st.caption(
@@ -1390,7 +1396,7 @@ for config in instruments_config:
             # Prolonge les niveaux dans l'espace libre à droite du graphique.
             interval_minutes = {"M1": 1, "M5": 5, "M15": 15, "M30": 30,
                                 "H1": 60, "H4": 240, "D": 1440, "W": 10080}.get(timeframe, 5)
-            chart_end = pd.Timestamp(x1) + pd.Timedelta(minutes=interval_minutes * 24)
+            chart_end = pd.Timestamp(x1) + pd.Timedelta(minutes=interval_minutes * 8)
             origin_price = float(fib["origin"]["price"])
             endpoint_price = float(fib["endpoint"]["price"])
             midpoint_price = float(fib["levels"][0.5])
@@ -1500,7 +1506,15 @@ for config in instruments_config:
             )
         )
         if fib:
-            fig.update_xaxes(range=[df["time"].iloc[0], chart_end])
+            if focus_fib_chart:
+                # Cadre le graphique autour de la fenêtre récente utilisée pour
+                # détecter le swing. Un petit coussin à gauche conserve le contexte,
+                # tandis que la projection à droite laisse respirer les niveaux.
+                latest_chart_time = pd.Timestamp(live_time if live_time is not None else df["time"].iloc[-1])
+                focus_start = latest_chart_time - pd.Timedelta(hours=float(fib_lookback_hours) * 1.12)
+                fig.update_xaxes(range=[focus_start, chart_end])
+            else:
+                fig.update_xaxes(range=[df["time"].iloc[0], chart_end])
         fig.update_xaxes(
             showgrid=True, gridcolor="rgba(76,115,153,0.20)",
             zeroline=False, showline=True, linecolor="#29445F",
