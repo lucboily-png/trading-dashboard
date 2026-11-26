@@ -576,111 +576,96 @@ def add_indicators(df):
 
 
 def find_last_fibonacci(df, pivot_window=2, min_leg_atr=1.5, lookback_hours=2):
-    """Détecte le swing majeur le plus pertinent dans la fenêtre récente.
+    """Retient le swing confirmé VALIDE le plus récent, jamais le plus grand.
 
-    Au lieu de toujours retenir les deux derniers micro-pivots (qui peuvent
-    réduire le Fibonacci à quelques pixels), compare les jambes confirmées
-    dans les dernières `lookback_bars` chandelles et retient la plus ample.
-    Les pivots restent confirmés avec `pivot_window` chandelles à droite.
+    Les pivots sont confirmés par `pivot_window` chandelles à droite.
+    On parcourt les jambes de la plus récente à la plus ancienne et on garde
+    la première dont l'amplitude est suffisante et dont l'origine n'est pas
+    invalidée par une clôture ultérieure.
     """
-    data = df.reset_index(drop=True)
-    if len(data) < max(40, pivot_window * 2 + 20):
-        return None, "Données insuffisantes pour détecter un swing fiable."
+    data = df.reset_index(drop=True).copy()
+    minimum = max(40, pivot_window * 2 + 20)
+    if len(data) < minimum:
+        return None, "Données insuffisantes pour confirmer un swing."
+
+    times = pd.to_datetime(data["time"], errors="coerce")
+    if times.isna().all():
+        return None, "Horodatages indisponibles pour détecter le dernier swing."
+    cutoff = times.iloc[-1] - pd.Timedelta(hours=float(lookback_hours))
+    in_window = times.ge(cutoff)
+    if not in_window.any():
+        return None, f"Aucun swing dans les {lookback_hours:g} dernières heures."
+    first_allowed = int(in_window[in_window].index[0])
 
     pivots = []
-    for i in range(pivot_window, len(data) - pivot_window):
-        high = float(data.loc[i, "high"])
-        low = float(data.loc[i, "low"])
+    # La dernière chandelle du dataframe est clôturée; les pivots récents
+    # restent confirmés uniquement si leurs chandelles à droite existent.
+    for i in range(max(pivot_window, first_allowed), len(data) - pivot_window):
         left = data.iloc[i-pivot_window:i]
         right = data.iloc[i+1:i+pivot_window+1]
-        is_high = high > float(left["high"].max()) and high >= float(right["high"].max())
-        is_low = low < float(left["low"].min()) and low <= float(right["low"].min())
-        if is_high:
-            pivots.append({"index": i, "type": "HIGH", "price": high, "time": data.loc[i, "time"]})
-        if is_low:
-            pivots.append({"index": i, "type": "LOW", "price": low, "time": data.loc[i, "time"]})
+        high, low = float(data.at[i, "high"]), float(data.at[i, "low"])
+        if high > float(left["high"].max()) and high >= float(right["high"].max()):
+            pivots.append({"index": i, "type": "HIGH", "price": high, "time": data.at[i, "time"]})
+        if low < float(left["low"].min()) and low <= float(right["low"].min()):
+            pivots.append({"index": i, "type": "LOW", "price": low, "time": data.at[i, "time"]})
 
-    pivots.sort(key=lambda x: x["index"])
+    pivots.sort(key=lambda item: (item["index"], 0 if item["type"] == "LOW" else 1))
     alternating = []
     for pivot in pivots:
         if not alternating or alternating[-1]["type"] != pivot["type"]:
             alternating.append(pivot)
         else:
-            old = alternating[-1]
-            more_extreme = (
-                pivot["price"] > old["price"] if pivot["type"] == "HIGH"
-                else pivot["price"] < old["price"]
-            )
+            previous = alternating[-1]
+            more_extreme = (pivot["price"] > previous["price"] if pivot["type"] == "HIGH"
+                            else pivot["price"] < previous["price"])
             if more_extreme:
                 alternating[-1] = pivot
 
-    if len(alternating) < 2:
-        return None, "Aucun mouvement haussier ou baissier confirmé détecté."
+    atr = pd.to_numeric(data["ATR14"], errors="coerce").iloc[-1] if "ATR14" in data else float("nan")
+    if pd.isna(atr) or float(atr) <= 0:
+        return None, "ATR indisponible : impossible de valider la taille du swing."
 
-    atr = float(data.iloc[-1].get("ATR14", float("nan")))
-    if pd.isna(atr) or atr <= 0:
-        return None, "ATR indisponible : impossible de mesurer la taille du swing."
-
-    times = pd.to_datetime(data["time"], errors="coerce")
-    latest_time = times.iloc[-1]
-    cutoff_time = latest_time - pd.Timedelta(hours=float(lookback_hours))
-    first_allowed = int(times.ge(cutoff_time).idxmax()) if times.ge(cutoff_time).any() else len(data) - 1
-    recent_count = len(data) - first_allowed
-    # En très petits timeframes, conserver assez de chandelles pour confirmer
-    # deux pivots; la fenêtre horaire demeure prioritaire.
-    if recent_count < max(8, pivot_window * 2 + 4):
-        return None, (
-            f"Pas assez de chandelles dans les {lookback_hours:g} dernières heures "
-            "pour confirmer un swing. Essaie une fenêtre un peu plus longue."
-        )
-    candidates = []
-    for origin, endpoint in zip(alternating[:-1], alternating[1:]):
+    # Dernière jambe valide d'abord : aucun classement par taille.
+    for origin, endpoint in reversed(list(zip(alternating[:-1], alternating[1:]))):
         if origin["index"] < first_allowed or endpoint["index"] < first_allowed:
-            continue
-        if origin["type"] == endpoint["type"]:
-            continue
-        leg_size = abs(endpoint["price"] - origin["price"])
-        if leg_size < min_leg_atr * atr:
             continue
         bullish = origin["type"] == "LOW" and endpoint["type"] == "HIGH"
         bearish = origin["type"] == "HIGH" and endpoint["type"] == "LOW"
         if not (bullish or bearish):
             continue
-        # Favorise les jambes réellement structurantes plutôt que les petits
-        # allers-retours récents. La taille est normalisée par l'ATR courant.
-        candidates.append((leg_size / atr, origin, endpoint, leg_size, bullish))
+        leg_size = abs(float(endpoint["price"]) - float(origin["price"]))
+        if leg_size < float(min_leg_atr) * float(atr):
+            continue
 
-    if not candidates:
-        return None, "Aucun swing suffisamment ample et confirmé dans la fenêtre récente."
+        after_endpoint = data.iloc[endpoint["index"] + 1:]
+        if bullish:
+            invalidated = (not after_endpoint.empty and
+                           float(after_endpoint["close"].min()) < float(origin["price"]))
+            direction = "BULL"
+            levels = {r: float(endpoint["price"]) - leg_size * r for r in (0.382, 0.5, 0.618, 0.786)}
+            zone_low, zone_high = levels[0.618], levels[0.5]
+        else:
+            invalidated = (not after_endpoint.empty and
+                           float(after_endpoint["close"].max()) > float(origin["price"]))
+            direction = "BEAR"
+            levels = {r: float(endpoint["price"]) + leg_size * r for r in (0.382, 0.5, 0.618, 0.786)}
+            zone_low, zone_high = levels[0.5], levels[0.618]
 
-    # Le swing le plus ample dans la fenêtre donne une structure lisible.
-    _, origin, endpoint, leg_size, bullish = max(candidates, key=lambda item: item[0])
+        if invalidated:
+            continue
+        return {
+            "direction": direction,
+            "origin": origin,
+            "endpoint": endpoint,
+            "levels": levels,
+            "zone_low": zone_low,
+            "zone_high": zone_high,
+            "leg_size": leg_size,
+            "atr": float(atr),
+        }, "Dernier Fibonacci valide confirmé sélectionné."
 
-    if bullish:
-        levels = {r: endpoint["price"] - leg_size * r for r in (0.382, 0.5, 0.618, 0.786)}
-        zone_low, zone_high = levels[0.618], levels[0.5]
-        invalidated = float(data.iloc[-1]["close"]) < origin["price"]
-        direction = "BULL"
-    else:
-        levels = {r: endpoint["price"] + leg_size * r for r in (0.382, 0.5, 0.618, 0.786)}
-        zone_low, zone_high = levels[0.5], levels[0.618]
-        invalidated = float(data.iloc[-1]["close"]) > origin["price"]
-        direction = "BEAR"
-
-    if invalidated:
-        return None, "Fibonacci invalidé : le prix a dépassé le point de départ du mouvement."
-
-    return {
-        "direction": direction,
-        "origin": origin,
-        "endpoint": endpoint,
-        "levels": levels,
-        "zone_low": zone_low,
-        "zone_high": zone_high,
-        "leg_size": leg_size,
-        "atr": atr,
-    }, "Swing majeur confirmé sélectionné automatiquement dans les dernières chandelles."
-
+    return None, (f"Aucun Fibonacci valide confirmé dans les {lookback_hours:g} dernières heures. "
+                  "Aucun niveau n'est affiché plutôt que de forcer un swing douteux.")
 
 
 def find_related_fvg(df, fib):
@@ -1341,6 +1326,9 @@ for config in instruments_config:
         )
         st.caption(f"Dernière chandelle clôturée : {candle_time}")
         if fib:
+            swing_start_label = pd.Timestamp(fib["origin"]["time"]).strftime("%H:%M")
+            swing_end_label = pd.Timestamp(fib["endpoint"]["time"]).strftime("%H:%M")
+            st.caption(f"Swing retenu : {swing_start_label} → {swing_end_label} NY · dernier mouvement confirmé valide")
             fib_col1, fib_col2, fib_col3, fvg_col = st.columns([1, 1, 1, 1.35])
             fib_col1.metric("FIBONACCI 0 · EXTRÉMITÉ", f"{float(fib['endpoint']['price']):,.{price_decimals}f}")
             fib_col2.metric("FIBONACCI 0,5 · MILIEU", f"{float(fib['levels'][0.5]):,.{price_decimals}f}")
@@ -1435,30 +1423,25 @@ for config in instruments_config:
         chart_end = pd.Timestamp(latest_for_chart) + pd.Timedelta(minutes=interval_minutes * 2)
         if setup.get("fib"):
             fib = setup["fib"]
-            x0 = chart_df["time"].iloc[0]
+            # Les niveaux commencent exactement à l'origine du swing :
+            # les anciennes chandelles ne sont plus traversées par le Fib.
+            x0 = pd.Timestamp(fib["origin"]["time"])
             x1 = live_time if live_time is not None else chart_df["time"].iloc[-1]
             # Prolonge les niveaux dans l'espace libre à droite du graphique.
             origin_price = float(fib["origin"]["price"])
             endpoint_price = float(fib["endpoint"]["price"])
             midpoint_price = float(fib["levels"][0.5])
 
-            # Fond discret du swing et zone de retracement, pour lire le Fib d'un coup d'œil.
+            # Une seule zone colorée : le retracement 50–61,8 %.
+            # On évite de teinter tout le swing et de masquer les chandelles.
+            fib_zone_low = min(float(fib["levels"][0.5]), float(fib["levels"][0.618]))
+            fib_zone_high = max(float(fib["levels"][0.5]), float(fib["levels"][0.618]))
             fig.add_shape(
                 type="rect", xref="x", yref="y",
                 x0=x0, x1=chart_end,
-                y0=min(origin_price, endpoint_price),
-                y1=max(origin_price, endpoint_price),
-                fillcolor="rgba(53,182,255,0.12)",
-                line=dict(color="rgba(53,182,255,0.55)", width=2, dash="solid"),
-                layer="below",
-            )
-            fig.add_shape(
-                type="rect", xref="x", yref="y",
-                x0=x0, x1=chart_end,
-                y0=min(origin_price, midpoint_price),
-                y1=max(origin_price, midpoint_price),
-                fillcolor="rgba(255,200,87,0.16)",
-                line=dict(width=0),
+                y0=fib_zone_low, y1=fib_zone_high,
+                fillcolor="rgba(255,200,87,0.17)",
+                line=dict(color="rgba(255,200,87,0.65)", width=1),
                 layer="below",
             )
             # Diagonale reliant les deux ancrages du mouvement mesuré.
@@ -1466,9 +1449,9 @@ for config in instruments_config:
                 x=[fib["origin"]["time"], fib["endpoint"]["time"]],
                 y=[origin_price, endpoint_price],
                 mode="lines+markers",
-                name="Swing mesuré",
+                name="Swing Fibonacci (2 ancrages)",
                 line=dict(color="#DCE8F5", width=2, dash="dash"),
-                marker=dict(size=8, color="#DCE8F5", line=dict(color="#071426", width=1)),
+                marker=dict(size=10, color="#DCE8F5", line=dict(color="#071426", width=1)),
                 hovertemplate="Swing Fibonacci<br>Prix: %{y:,.5f}<extra></extra>",
             ), row=1, col=1)
 
@@ -1555,7 +1538,13 @@ for config in instruments_config:
                                 "H1": 60, "H4": 240, "D": 1440, "W": 10080}.get(timeframe, 5)
             latest_chart_time = pd.Timestamp(live_time if live_time is not None else chart_df["time"].iloc[-1])
             candle_span = pd.Timedelta(minutes=interval_minutes * int(visible_candles))
-            focus_start = pd.Timestamp(chart_df["time"].iloc[0])
+            if fib:
+                focus_start = max(
+                    pd.Timestamp(chart_df["time"].iloc[0]),
+                    pd.Timestamp(fib["origin"]["time"]) - pd.Timedelta(minutes=interval_minutes * 3)
+                )
+            else:
+                focus_start = pd.Timestamp(chart_df["time"].iloc[0])
             right_padding = pd.Timedelta(minutes=interval_minutes * 3)
             fig.update_xaxes(range=[focus_start, latest_chart_time + right_padding])
         else:
@@ -1568,7 +1557,14 @@ for config in instruments_config:
         )
         # Échelle verticale focalisée sur le swing + les chandelles visibles :
         # c'est le changement essentiel pour que le Fib et le FVG remplissent le graphique.
-        y_values = [float(chart_df["low"].min()), float(chart_df["high"].max())]
+        if fib:
+            swing_view_start = pd.Timestamp(fib["origin"]["time"]) - pd.Timedelta(minutes=interval_minutes * 3)
+            scale_df = chart_df[chart_df["time"] >= swing_view_start]
+            if scale_df.empty:
+                scale_df = chart_df.tail(min(12, len(chart_df)))
+        else:
+            scale_df = chart_df
+        y_values = [float(scale_df["low"].min()), float(scale_df["high"].max())]
         if fib:
             y_values.extend([float(fib["endpoint"]["price"]), float(fib["origin"]["price"]), float(fib["levels"][0.5]), float(fib["levels"][0.618])])
         if fvg:
