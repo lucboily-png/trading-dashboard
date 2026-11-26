@@ -30,7 +30,8 @@ st.markdown("""
 h1,h2,h3,h4 { color:#f1f7ff !important; letter-spacing:-.025em; }
 [data-testid="stMetric"] { background:linear-gradient(145deg,rgba(16,43,72,.95),rgba(8,24,43,.95)); border:1px solid #1c456c; padding:14px 16px; border-radius:15px; box-shadow:0 8px 24px rgba(0,0,0,.18); }
 [data-testid="stMetricLabel"] { color:#9db8d4 !important; }
-[data-testid="stMetricValue"] { color:#f4f8ff !important; }
+[data-testid="stMetricValue"] { color:#f4f8ff !important; font-size:clamp(1.65rem,2.4vw,2.7rem) !important; font-weight:850 !important; }
+[data-testid="stMetricLabel"] { font-size:1rem !important; font-weight:750 !important; letter-spacing:.04em; }
 [data-testid="stVerticalBlockBorderWrapper"] { background:linear-gradient(145deg,rgba(13,32,56,.92),rgba(7,20,36,.92)); border:1px solid #1b4267; border-radius:17px; }
 .stButton>button, .stDownloadButton>button { border-radius:10px; border:1px solid #187fbe; background:linear-gradient(100deg,#087cc4,#12a9ed); color:white; font-weight:650; }
 .stButton>button:hover, .stDownloadButton>button:hover { border-color:#5bdcff; color:white; }
@@ -90,7 +91,7 @@ hr { border-color:#1a3b5c !important; }
 }
 
 /* Espacement plus proche d'un terminal de trading */
-.block-container { padding-top:1.4rem; padding-bottom:2rem; max-width:1600px; }
+.block-container { padding-top:1rem; padding-bottom:1.5rem; max-width:none; width:100%; padding-left:1.1rem; padding-right:1.1rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -429,7 +430,10 @@ st.sidebar.caption(
     "Les deux emplacements libres peuvent servir à ajouter BTC/USD ou un autre timeframe."
 )
 
-st.sidebar.caption("Mode analyse visuelle : Fibonacci automatique ou manuel et FVG associé. Aucun signal ni ordre n’est généré.")
+st.sidebar.markdown("### ALERTES DE ZONES")
+zone_voice_enabled = st.sidebar.checkbox("Alerte sonore à l'arrivée dans une zone", value=True, key="zone_voice_enabled")
+zone_email_enabled = st.sidebar.checkbox("Alerte par courriel", value=False, key="zone_email_enabled")
+st.sidebar.caption("Une alerte indique une zone potentielle à surveiller, pas une confirmation d'achat ou de vente.")
 
 
 # OANDA DATA
@@ -1244,7 +1248,7 @@ for config in instruments_config:
             with height_col:
                 chart_height = st.slider(
                     "HAUTEUR DU GRAPHIQUE",
-                    min_value=750, max_value=1500, value=1100, step=50,
+                    min_value=900, max_value=1700, value=1350, step=50,
                     key=f"chart_height_{pair}_{timeframe}",
                     help="Augmente la hauteur pour agrandir le graphique verticalement, comme dans TradingView."
                 )
@@ -1256,7 +1260,7 @@ for config in instruments_config:
             )
             visible_candles = st.slider(
                 "NOMBRE DE CHANDELLES À AFFICHER",
-                min_value=15, max_value=100, value=35, step=5,
+                min_value=12, max_value=80, value=24, step=4,
                 key=f"visible_candles_{pair}_{timeframe}",
                 help="Moins de chandelles visibles = corps plus larges et meilleure lecture, comme un zoom avant dans TradingView."
             )
@@ -1338,32 +1342,57 @@ for config in instruments_config:
         st.caption(f"Dernière chandelle clôturée : {candle_time}")
         if fib:
             fib_col1, fib_col2, fib_col3, fvg_col = st.columns([1, 1, 1, 1.35])
-            fib_col1.metric("FIB 0 · EXTRÉMITÉ", f"{float(fib['endpoint']['price']):,.{price_decimals}f}")
-            fib_col2.metric("FIB 0,5 · MILIEU", f"{float(fib['levels'][0.5]):,.{price_decimals}f}")
-            fib_col3.metric("FIB 1 · ORIGINE", f"{float(fib['origin']['price']):,.{price_decimals}f}")
+            fib_col1.metric("FIBONACCI 0 · EXTRÉMITÉ", f"{float(fib['endpoint']['price']):,.{price_decimals}f}")
+            fib_col2.metric("FIBONACCI 0,5 · MILIEU", f"{float(fib['levels'][0.5]):,.{price_decimals}f}")
+            fib_col3.metric("FIBONACCI 1 · ORIGINE", f"{float(fib['origin']['price']):,.{price_decimals}f}")
             if fvg:
                 fvg_side = "HAUSSIER" if fvg["direction"] == "BULL" else "BAISSIER"
-                fvg_col.metric(
-                    f"FVG {fvg_side}",
-                    f"{fvg['low']:,.{price_decimals}f} – {fvg['high']:,.{price_decimals}f}",
-                    "NON COMBLÉ"
-                )
+                fvg_col.metric(f"FVG {fvg_side} · NON COMBLÉ", f"{fvg['low']:,.{price_decimals}f} – {fvg['high']:,.{price_decimals}f}", "Zone de déséquilibre à surveiller")
             else:
-                fvg_col.metric("FVG ASSOCIÉ", "Non détecté", "Aucun gap valide dans ce swing")
+                fvg_col.metric("FVG ASSOCIÉ", "NON DÉTECTÉ", "Aucun FVG valide dans ce swing")
+
+            # Alertes de proximité : zone Fibonacci 50–61,8 % et FVG associé.
+            # Ce sont des alertes de zone, jamais des ordres ni des confirmations d'entrée.
+            fib_zone_hit = float(fib['zone_low']) <= current_price <= float(fib['zone_high'])
+            fvg_hit = bool(fvg and float(fvg['low']) <= current_price <= float(fvg['high']))
+            if fib_zone_hit or fvg_hit:
+                side = "ACHAT POTENTIEL" if fib['direction'] == "BULL" else "VENTE POTENTIELLE"
+                hit_name = "Fibonacci 50–61,8 %" if fib_zone_hit else "FVG associé"
+                alert_key = f"zone_alert_{pair}_{timeframe}_{fib['direction']}_{fib['origin']['time']}_{fib['endpoint']['time']}"
+                if not st.session_state.get(alert_key, False):
+                    alert_subject = f"{side} — {pair} {timeframe} — zone atteinte"
+                    alert_body = (f"{side} sur {pair} en {timeframe}.\n"
+                                  f"Le prix {current_price:,.{price_decimals}f} vient d'atteindre : {hit_name}.\n"
+                                  f"Zone Fibonacci : {fib['zone_low']:,.{price_decimals}f} à {fib['zone_high']:,.{price_decimals}f}.\n"
+                                  + (f"FVG : {fvg['low']:,.{price_decimals}f} à {fvg['high']:,.{price_decimals}f}.\n" if fvg else "")
+                                  + "Ceci est une alerte de surveillance, pas une confirmation d'entrée. Attendre une réaction du prix.")
+                    st.warning(f"⚡ {side} — {pair} {timeframe} : le prix atteint {hit_name}. Prix : {current_price:,.{price_decimals}f}. Attendre une réaction avant toute décision.")
+                    if zone_voice_enabled:
+                        play_voice_alert(VOICE_STRONG_BULL if fib['direction'] == 'BULL' else VOICE_STRONG_BEAR)
+                    if zone_email_enabled:
+                        sent, status = send_email_alert(alert_subject, alert_body)
+                        if not sent:
+                            st.warning(status)
+                    st.session_state[alert_key] = True
+            else:
+                st.caption("Aucune zone d'intérêt atteinte pour le moment. Surveillance de la zone Fibonacci 50–61,8 % et du FVG.")
         else:
             st.info(fib_message)
 
-        # CHART
+        # CHART — cadrage serré : peu de bougies, pleine largeur, grande échelle verticale.
+        # On garde les données complètes pour le calcul du swing/FVG, mais on ne trace
+        # que les dernières chandelles pour que les bougies et les niveaux occupent l'écran.
+        chart_df = df.tail(int(visible_candles)).copy()
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.82, 0.18], vertical_spacing=0.05
+            row_heights=[0.94, 0.06], vertical_spacing=0.025
         )
 
         # Ligne Close des chandelles clôturées, prolongée jusqu'au prix actuel.
         # Le dernier point correspond à la chandelle OANDA encore en formation.
         live_time = None
-        close_x = df["time"].tolist()
-        close_y = df["close"].astype(float).tolist()
+        close_x = chart_df["time"].tolist()
+        close_y = chart_df["close"].astype(float).tolist()
 
         if not raw_df.empty and not bool(raw_df.iloc[-1]["complete"]):
             live_time = pd.to_datetime(
@@ -1376,11 +1405,11 @@ for config in instruments_config:
 
         fig.add_trace(
             go.Candlestick(
-                x=df["time"], open=df["open"], high=df["high"],
-                low=df["low"], close=df["close"], name="Chandelles OANDA",
+                x=chart_df["time"], open=chart_df["open"], high=chart_df["high"],
+                low=chart_df["low"], close=chart_df["close"], name="Chandelles OANDA",
                 increasing_line_color="#20b96b", decreasing_line_color="#ef5350",
                 increasing_fillcolor="#20b96b", decreasing_fillcolor="#ef5350",
-                increasing_line_width=2, decreasing_line_width=2,
+                increasing_line_width=3.5, decreasing_line_width=3.5,
                 whiskerwidth=0.8,
             ), row=1, col=1
         )
@@ -1396,14 +1425,15 @@ for config in instruments_config:
             row=1, col=1
         )
 
+        interval_minutes = {"M1": 1, "M5": 5, "M15": 15, "M30": 30,
+                            "H1": 60, "H4": 240, "D": 1440, "W": 10080}.get(timeframe, 5)
+        latest_for_chart = live_time if live_time is not None else chart_df["time"].iloc[-1]
+        chart_end = pd.Timestamp(latest_for_chart) + pd.Timedelta(minutes=interval_minutes * 2)
         if setup.get("fib"):
             fib = setup["fib"]
-            x0 = fib["origin"]["time"]
-            x1 = live_time if live_time is not None else df["time"].iloc[-1]
+            x0 = chart_df["time"].iloc[0]
+            x1 = live_time if live_time is not None else chart_df["time"].iloc[-1]
             # Prolonge les niveaux dans l'espace libre à droite du graphique.
-            interval_minutes = {"M1": 1, "M5": 5, "M15": 15, "M30": 30,
-                                "H1": 60, "H4": 240, "D": 1440, "W": 10080}.get(timeframe, 5)
-            chart_end = pd.Timestamp(x1) + pd.Timedelta(minutes=interval_minutes * 8)
             origin_price = float(fib["origin"]["price"])
             endpoint_price = float(fib["endpoint"]["price"])
             midpoint_price = float(fib["levels"][0.5])
@@ -1447,16 +1477,16 @@ for config in instruments_config:
                 fig.add_trace(go.Scatter(
                     x=[x0, x1], y=[level, level], mode="lines",
                     name=f"Fibonacci {level_name} · {level:,.{price_decimals}f}",
-                    line=dict(color=fib_color, width=3.5),
+                    line=dict(color=fib_color, width=7),
                     hovertemplate=f"Fibonacci {level_name}<br>Prix: %{{y:,.{price_decimals}f}}<extra></extra>"
                 ), row=1, col=1)
                 fig.add_annotation(
                     x=chart_end, y=level, xref="x", yref="y",
                     text=f"FIB {level_name}  ·  {level:,.{price_decimals}f}",
                     showarrow=False, xanchor="left", xshift=5,
-                    font=dict(color=fib_color, size=15, family="Arial Black"),
+                    font=dict(color=fib_color, size=23, family="Arial Black"),
                     bgcolor="rgba(7,20,38,0.94)",
-                    bordercolor=fib_color, borderwidth=2, borderpad=7,
+                    bordercolor=fib_color, borderwidth=3, borderpad=12,
                 )
             if fvg:
                 fvg_color = "rgba(32,214,138,0.22)" if fvg["direction"] == "BULL" else "rgba(255,91,110,0.22)"
@@ -1465,7 +1495,7 @@ for config in instruments_config:
                     type="rect", xref="x", yref="y",
                     x0=fvg["start_time"], x1=chart_end,
                     y0=fvg["low"], y1=fvg["high"],
-                    fillcolor=fvg_color, line=dict(color=fvg_line, width=3),
+                    fillcolor=fvg_color, line=dict(color=fvg_line, width=5),
                     layer="above",
                 )
                 fig.add_annotation(
@@ -1473,7 +1503,7 @@ for config in instruments_config:
                     text=f"FVG {fvg['low']:,.{price_decimals}f} – {fvg['high']:,.{price_decimals}f} · NON COMBLÉ",
                     showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=2.2,
                     arrowcolor=fvg_line, ax=0, ay=-32, xanchor="left",
-                    font=dict(color=fvg_line, size=15, family="Arial Black"),
+                    font=dict(color=fvg_line, size=22, family="Arial Black"),
                     bgcolor="rgba(7,20,38,0.94)",
                     bordercolor=fvg_line, borderwidth=1, borderpad=4,
                 )
@@ -1489,7 +1519,7 @@ for config in instruments_config:
 
         fig.add_trace(
             go.Bar(
-                x=df["time"], y=df["volume"], name="Volume",
+                x=chart_df["time"], y=chart_df["volume"], name="Volume",
                 marker_color="rgba(53,182,255,0.48)", hoverinfo="none"
             ), row=2, col=1
         )
@@ -1500,11 +1530,12 @@ for config in instruments_config:
             paper_bgcolor="#071426",
             plot_bgcolor="#091B30",
             font=dict(family="Inter, Arial, sans-serif", color="#DCE8F5", size=12),
-            margin=dict(l=20, r=20, t=55, b=20),
+            margin=dict(l=18, r=260, t=42, b=18),
+            autosize=True,
             legend=dict(
                 orientation="h", y=1.08, x=0,
                 bgcolor="rgba(7,20,38,0.72)",
-                font=dict(color="#DCE8F5", size=11)
+                font=dict(color="#DCE8F5", size=13)
             ),
             hovermode="x",
             hoverlabel=dict(
@@ -1518,23 +1549,33 @@ for config in instruments_config:
             # toute la fenêtre de recherche du swing.
             interval_minutes = {"M1": 1, "M5": 5, "M15": 15, "M30": 30,
                                 "H1": 60, "H4": 240, "D": 1440, "W": 10080}.get(timeframe, 5)
-            latest_chart_time = pd.Timestamp(live_time if live_time is not None else df["time"].iloc[-1])
+            latest_chart_time = pd.Timestamp(live_time if live_time is not None else chart_df["time"].iloc[-1])
             candle_span = pd.Timedelta(minutes=interval_minutes * int(visible_candles))
-            focus_start = latest_chart_time - candle_span
+            focus_start = pd.Timestamp(chart_df["time"].iloc[0])
             right_padding = pd.Timedelta(minutes=interval_minutes * 3)
             fig.update_xaxes(range=[focus_start, latest_chart_time + right_padding])
         else:
-            fig.update_xaxes(range=[df["time"].iloc[0], chart_end])
+            fig.update_xaxes(range=[chart_df["time"].iloc[0], chart_end])
         fig.update_xaxes(
             showgrid=True, gridcolor="rgba(76,115,153,0.20)",
             zeroline=False, showline=True, linecolor="#29445F",
             tickfont=dict(color="#AFC2D8"),
             title_font=dict(color="#AFC2D8")
         )
+        # Échelle verticale focalisée sur le swing + les chandelles visibles :
+        # c'est le changement essentiel pour que le Fib et le FVG remplissent le graphique.
+        y_values = [float(chart_df["low"].min()), float(chart_df["high"].max())]
+        if fib:
+            y_values.extend([float(fib["endpoint"]["price"]), float(fib["origin"]["price"]), float(fib["levels"][0.5]), float(fib["levels"][0.618])])
+        if fvg:
+            y_values.extend([float(fvg["low"]), float(fvg["high"])])
+        y_min, y_max = min(y_values), max(y_values)
+        y_pad = max((y_max - y_min) * 0.14, abs(y_max) * 0.00015, 1e-6)
+        fig.update_yaxes(range=[y_min - y_pad, y_max + y_pad], row=1, col=1)
         fig.update_yaxes(
             showgrid=True, gridcolor="rgba(76,115,153,0.20)",
             zeroline=False, showline=True, linecolor="#29445F",
-            tickfont=dict(color="#AFC2D8"),
+            tickfont=dict(color="#DCE8F5", size=14),
             title_font=dict(color="#AFC2D8")
         )
         # Panneau fixe de lecture : les valeurs suivent la chandelle survolée,
@@ -1608,4 +1649,4 @@ for config in instruments_config:
 
 
 st.markdown("---")
-st.caption("Mode analyse visuelle activé : aucun courriel, signal automatique ou trade virtuel n’est déclenché. Les anciennes données Supabase et l’historique des alertes ne sont pas supprimés.")
+st.caption("Mode analyse visuelle : alertes uniquement lorsque le prix atteint la zone Fibonacci 50–61,8 % ou le FVG. Aucune confirmation d’entrée, aucun ordre OANDA et aucun trade virtuel ne sont générés. Les anciennes données Supabase sont conservées.")
