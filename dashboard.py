@@ -330,12 +330,13 @@ def load_virtual_trade_stats():
 
 
 ACCESS_TOKEN = get_secret("OANDA_ACCESS_TOKEN")
-ACCOUNT_ID = get_secret("OANDA_ACCOUNT_ID")
+# Compte Practice explicitement demandé par l’utilisateur (Good one).
+ACCOUNT_ID = "101-002-37205058-004"
 
 if not ACCESS_TOKEN or not ACCOUNT_ID:
     st.error(
-        "Configuration OANDA manquante. Ajoute OANDA_ACCESS_TOKEN et "
-        "OANDA_ACCOUNT_ID dans les Secrets de ton application Streamlit."
+        "Configuration OANDA manquante. Ajoute OANDA_ACCESS_TOKEN dans les Secrets "
+        "de ton application Streamlit."
     )
     st.stop()
 
@@ -344,6 +345,18 @@ client = API(access_token=ACCESS_TOKEN, environment="practice")
 
 def load_oanda_real_performance(days=90):
     """Charge les transactions et positions réelles du compte OANDA Practice."""
+    # Vérifie que le jeton API Practice donne bien accès au compte demandé.
+    account_list_request = oanda_accounts.AccountList()
+    client.request(account_list_request)
+    authorized_accounts = account_list_request.response.get("accounts", []) or []
+    authorized_ids = [str(item.get("id", "")) for item in authorized_accounts]
+    if ACCOUNT_ID not in authorized_ids:
+        raise RuntimeError(
+            f"Le jeton OANDA Practice configuré n'a pas accès au compte {ACCOUNT_ID}. "
+            f"Comptes autorisés par ce jeton : {', '.join(authorized_ids) or 'aucun'}. "
+            "Vérifie le jeton API Practice OANDA et régénère-le si ce compte a été ajouté récemment."
+        )
+
     now_utc = pd.Timestamp.now(tz="UTC")
     start_utc = now_utc - pd.Timedelta(days=days)
 
@@ -453,6 +466,7 @@ def load_oanda_real_performance(days=90):
     open_df = pd.DataFrame(open_rows)
 
     return {
+        "account_id": ACCOUNT_ID,
         "currency": account_currency,
         "summary": summary,
         "fills": fills_df,
@@ -1689,6 +1703,7 @@ try:
     oanda_summary = oanda_data["summary"]
     oanda_now = pd.Timestamp.now(tz="America/Toronto")
     currency_label = oanda_currency
+    st.caption(f"Compte vérifié auprès d’OANDA : Good one — {oanda_data['account_id']} · Environnement Practice")
 
     if oanda_fills.empty:
         oanda_today = pd.DataFrame()
