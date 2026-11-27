@@ -7,6 +7,9 @@ import pytz
 import streamlit.components.v1 as components
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
+import oandapyV20.endpoints.accounts as oanda_accounts
+import oandapyV20.endpoints.transactions as oanda_transactions
+import oandapyV20.endpoints.trades as oanda_trades
 from streamlit_autorefresh import st_autorefresh
 import smtplib
 import requests
@@ -336,6 +339,102 @@ if not ACCESS_TOKEN or not ACCOUNT_ID:
     st.stop()
 
 client = API(access_token=ACCESS_TOKEN, environment="practice")
+
+
+def load_oanda_real_performance(days=90):
+    """Charge les transactions et positions réelles du compte OANDA Practice."""
+    now_utc = pd.Timestamp.now(tz="UTC")
+    start_utc = now_utc - pd.Timedelta(days=days)
+
+    summary_request = oanda_accounts.AccountSummary(ACCOUNT_ID)
+    client.request(summary_request)
+    summary = summary_request.response.get("account", {})
+    account_currency = summary.get("currency", "USD")
+
+    transaction_request = oanda_transactions.TransactionList(
+        ACCOUNT_ID,
+        params={
+            "from": start_utc.strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
+            "to": now_utc.strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
+            "pageSize": 1000,
+        },
+    )
+    client.request(transaction_request)
+    transaction_response = transaction_request.response or {}
+    transactions_list = transaction_response.get("transactions", [])
+
+    # Certains comptes peuvent avoir plus de 1 000 transactions dans la période.
+    # On suit les pages retournées par OANDA, sans reconstruire d'URL manuellement.
+    page_urls = transaction_response.get("pages", []) or []
+    for page_url in page_urls[1:10]:
+        try:
+            page_request = oanda_transactions.TransactionList(
+                ACCOUNT_ID, params={"page": page_url}
+            )
+            client.request(page_request)
+            transactions_list.extend(
+                page_request.response.get("transactions", []) or []
+            )
+        except Exception:
+            # La première page reste exploitable si une page historique échoue.
+            break
+
+    fills = []
+    for tx in transactions_list:
+        if str(tx.get("type", "")).upper() != "ORDER_FILL":
+            continue
+        timestamp = pd.to_datetime(tx.get("time"), utc=True, errors="coerce")
+        if pd.isna(timestamp):
+            continue
+
+        # OANDA fournit les montants signés : le financement et la commission
+        # sont ajoutés au P/L de la transaction pour obtenir le net du compte.
+        pl = float(tx.get("pl", 0) or 0)
+        financing = float(tx.get("financing", 0) or 0)
+        commission = float(tx.get("commission", 0) or 0)
+        fills.append({
+            "time_utc": timestamp,
+            "instrument": tx.get("instrument", "Autre"),
+            "pl": pl,
+            "financing": financing,
+            "commission": commission,
+            "net": pl + financing + commission,
+            "transaction_id": tx.get("id"),
+            "reason": tx.get("reason", ""),
+        })
+
+    fills_df = pd.DataFrame(fills)
+    if not fills_df.empty:
+        fills_df["time_quebec"] = fills_df["time_utc"].dt.tz_convert(
+            "America/Toronto"
+        )
+        fills_df["date_quebec"] = fills_df["time_quebec"].dt.strftime("%Y-%m-%d")
+
+    open_request = oanda_trades.OpenTrades(ACCOUNT_ID)
+    client.request(open_request)
+    open_trades = open_request.response.get("trades", []) or []
+
+    open_rows = []
+    for trade in open_trades:
+        open_rows.append({
+            "Instrument": trade.get("instrument", "Autre"),
+            "Direction": "ACHAT" if float(trade.get("currentUnits", 0) or 0) > 0 else "VENTE",
+            "Unités": float(trade.get("currentUnits", 0) or 0),
+            "Prix d'entrée": float(trade.get("price", 0) or 0),
+            "P/L latent": float(trade.get("unrealizedPL", 0) or 0),
+            "Ouvert le": trade.get("openTime", ""),
+        })
+    open_df = pd.DataFrame(open_rows)
+
+    return {
+        "currency": account_currency,
+        "summary": summary,
+        "fills": fills_df,
+        "open_trades": open_df,
+        "transactions_count": len(transactions_list),
+    }
+
+
 
 VOICE_STRONG_BULL = (
     "https://cdn.pixabay.com/download/audio/2023/03/22/"
@@ -1543,6 +1642,156 @@ for config in instruments_config:
 
     except Exception as exc:
         st.error(f"Erreur pour {pair} ({timeframe}) : {exc}")
+
+
+# BILAN DU COMPTE OANDA — DONNÉES RÉELLES (PRACTICE)
+st.markdown("---")
+st.subheader("💰 Résultats réels — Compte OANDA Practice")
+st.caption(
+    "Données lues directement dans OANDA, indépendamment des trades virtuels Supabase. "
+    "Actualisation automatique selon le rafraîchissement du dashboard."
+)
+
+try:
+    oanda_data = load_oanda_real_performance(days=90)
+    oanda_currency = oanda_data["currency"]
+    oanda_fills = oanda_data["fills"]
+    oanda_open = oanda_data["open_trades"]
+    oanda_summary = oanda_data["summary"]
+    oanda_now = pd.Timestamp.now(tz="America/Toronto")
+    currency_label = oanda_currency
+
+    if oanda_fills.empty:
+        oanda_today = pd.DataFrame()
+        oanda_yesterday = pd.DataFrame()
+    else:
+        oanda_today = oanda_fills.loc[
+            oanda_fills["time_quebec"].dt.date == oanda_now.date()
+        ].copy()
+        yesterday_date = (oanda_now - pd.Timedelta(days=1)).date()
+        oanda_yesterday = oanda_fills.loc[
+            oanda_fills["time_quebec"].dt.date == yesterday_date
+        ].copy()
+
+    today_realized = float(oanda_today["net"].sum()) if not oanda_today.empty else 0.0
+    yesterday_realized = (
+        float(oanda_yesterday["net"].sum()) if not oanda_yesterday.empty else 0.0
+    )
+    open_unrealized = (
+        float(oanda_open["P/L latent"].sum()) if not oanda_open.empty else 0.0
+    )
+
+    # Valeurs du compte affichées séparément du P/L journalier.
+    balance = float(oanda_summary.get("balance", 0) or 0)
+    nav = float(oanda_summary.get("NAV", balance) or balance)
+    margin_available = float(oanda_summary.get("marginAvailable", 0) or 0)
+
+    oanda_cols = st.columns(5)
+    oanda_cols[0].metric(
+        "P/L réalisé aujourd'hui", f"{today_realized:+,.2f} {currency_label}"
+    )
+    oanda_cols[1].metric(
+        "P/L réalisé hier", f"{yesterday_realized:+,.2f} {currency_label}"
+    )
+    oanda_cols[2].metric(
+        "P/L latent (positions ouvertes)", f"{open_unrealized:+,.2f} {currency_label}"
+    )
+    oanda_cols[3].metric("Solde du compte", f"{balance:,.2f} {currency_label}")
+    oanda_cols[4].metric("Valeur nette (NAV)", f"{nav:,.2f} {currency_label}")
+
+    st.caption(
+        f"Marge disponible : {margin_available:,.2f} {currency_label} · "
+        f"{len(oanda_open)} position(s) ouverte(s) · "
+        f"Historique interrogé : 90 jours · Fuseau : Québec"
+    )
+
+    if not oanda_fills.empty:
+        st.markdown("#### 📆 Historique quotidien OANDA")
+        oanda_daily = (
+            oanda_fills.groupby("date_quebec", as_index=False)
+            .agg(
+                Transactions=("transaction_id", "count"),
+                **{
+                    "P/L brut": ("pl", "sum"),
+                    "Financement": ("financing", "sum"),
+                    "Commissions": ("commission", "sum"),
+                    "P/L net": ("net", "sum"),
+                },
+            )
+            .sort_values("date_quebec", ascending=False)
+        )
+        oanda_daily["Date"] = pd.to_datetime(
+            oanda_daily["date_quebec"], errors="coerce"
+        ).dt.strftime("%d/%m/%Y")
+        st.dataframe(
+            oanda_daily[
+                ["Date", "Transactions", "P/L brut", "Financement",
+                 "Commissions", "P/L net"]
+            ],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "P/L brut": st.column_config.NumberColumn(format="%+.2f"),
+                "Financement": st.column_config.NumberColumn(format="%+.2f"),
+                "Commissions": st.column_config.NumberColumn(format="%+.2f"),
+                "P/L net": st.column_config.NumberColumn(
+                    "P/L net", format="%+.2f"
+                ),
+            },
+        )
+
+        st.markdown("#### 🧾 Détail des transactions exécutées")
+        detail = oanda_fills.sort_values("time_quebec", ascending=False).copy()
+        detail["Heure (Québec)"] = detail["time_quebec"].dt.strftime(
+            "%d/%m/%Y %H:%M:%S"
+        )
+        detail = detail.rename(columns={
+            "instrument": "Instrument",
+            "pl": "P/L brut",
+            "financing": "Financement",
+            "commission": "Commission",
+            "net": "Net",
+        })
+        st.dataframe(
+            detail[["Heure (Québec)", "Instrument", "P/L brut",
+                    "Financement", "Commission", "Net"]],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "P/L brut": st.column_config.NumberColumn(format="%+.2f"),
+                "Financement": st.column_config.NumberColumn(format="%+.2f"),
+                "Commission": st.column_config.NumberColumn(format="%+.2f"),
+                "Net": st.column_config.NumberColumn(format="%+.2f"),
+            },
+        )
+    else:
+        st.info(
+            "Aucune transaction exécutée trouvée dans les 90 derniers jours. "
+            "Les positions ouvertes apparaissent séparément ci-dessous."
+        )
+
+    st.markdown("#### 📍 Positions actuellement ouvertes chez OANDA")
+    if oanda_open.empty:
+        st.info("Aucune position ouverte.")
+    else:
+        st.dataframe(
+            oanda_open,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "P/L latent": st.column_config.NumberColumn(
+                    f"P/L latent ({currency_label})", format="%+.2f"
+                ),
+                "Prix d'entrée": st.column_config.NumberColumn(format="%.5f"),
+                "Unités": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+
+except Exception as oanda_exc:
+    st.error(
+        "Impossible de lire le bilan réel OANDA pour le moment. "
+        f"Vérifie la connexion Practice et les permissions API. Détail : {oanda_exc}"
+    )
 
 
 # SUIVI DES TRADES VIRTUELS SUPABASE
