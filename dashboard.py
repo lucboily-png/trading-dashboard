@@ -1637,6 +1637,100 @@ else:
                 else (float("inf") if week_gross_profit > 0 else 0.0)
             )
 
+            # PERFORMANCE JOURNALIERE — journée civile au fuseau du Québec.
+            # Seuls les trades WIN/LOSS clôturés sont comptabilisés.
+            today_local_date = now_local.date()
+            today_df = closed_df.loc[
+                closed_df["_close_local"].notna()
+                & (closed_df["_close_local"].dt.date == today_local_date)
+            ].copy()
+
+            today_trades = len(today_df)
+            today_wins = int((today_df["status"] == "WIN").sum())
+            today_losses = int((today_df["status"] == "LOSS").sum())
+            today_completed = today_wins + today_losses
+            today_win_rate = (
+                today_wins / today_completed * 100 if today_completed else 0.0
+            )
+            today_net_usd = (
+                float(today_df["pnl_usd"].sum()) if today_trades else 0.0
+            )
+            today_net_r = (
+                float(today_df["result_r"].sum()) if today_trades else 0.0
+            )
+
+            st.markdown("#### 📅 Performance de la journée")
+            st.caption(
+                f"Résultats des trades clôturés aujourd'hui ({now_local.strftime('%d %B %Y')}, "
+                "heure du Québec). Les trades encore ouverts ou en attente sont exclus."
+            )
+            daily_cols = st.columns(4)
+            daily_cols[0].metric(
+                "Profit / perte du jour",
+                f"{today_net_usd:+,.2f} $",
+                delta=f"{today_net_r:+.2f} R",
+                delta_color="normal",
+            )
+            daily_cols[1].metric("Trades clôturés", today_trades)
+            daily_cols[2].metric(
+                "Gagnants / perdants", f"{today_wins} / {today_losses}"
+            )
+            daily_cols[3].metric(
+                "Taux de réussite",
+                f"{today_win_rate:.1f}%" if today_completed else "N/D",
+            )
+
+            # Historique quotidien permanent : reconstruit depuis Supabase à chaque actualisation.
+            if not closed_df.empty:
+                daily_history = closed_df.loc[
+                    closed_df["_close_local"].notna()
+                ].copy()
+                daily_history["_jour"] = daily_history["_close_local"].dt.strftime("%Y-%m-%d")
+                daily_history = (
+                    daily_history.groupby("_jour", as_index=False)
+                    .agg(
+                        Trades=("status", "count"),
+                        Gagnants=("status", lambda values: int((values == "WIN").sum())),
+                        Perdants=("status", lambda values: int((values == "LOSS").sum())),
+                        **{
+                            "Résultat ($)": ("pnl_usd", "sum"),
+                            "Résultat (R)": ("result_r", "sum"),
+                        },
+                    )
+                )
+                daily_history["Taux réussite"] = (
+                    daily_history["Gagnants"]
+                    / (daily_history["Gagnants"] + daily_history["Perdants"]).replace(0, pd.NA)
+                    * 100
+                )
+                daily_history = daily_history.sort_values("_jour", ascending=False)
+                daily_history = daily_history.rename(columns={"_jour": "Date"})
+                daily_history["Date"] = pd.to_datetime(
+                    daily_history["Date"], errors="coerce"
+                ).dt.strftime("%d/%m/%Y")
+                st.markdown("##### Historique des journées")
+                st.dataframe(
+                    daily_history[
+                        ["Date", "Trades", "Gagnants", "Perdants",
+                         "Taux réussite", "Résultat ($)", "Résultat (R)"]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Taux réussite": st.column_config.NumberColumn(
+                            "Taux réussite", format="%.1f %%"
+                        ),
+                        "Résultat ($)": st.column_config.NumberColumn(
+                            "Profit / perte", format="%+.2f $"
+                        ),
+                        "Résultat (R)": st.column_config.NumberColumn(
+                            "Résultat", format="%+.2f R"
+                        ),
+                    },
+                )
+            else:
+                st.info("L'historique quotidien apparaîtra après la clôture du premier trade.")
+
             st.markdown("#### 💹 Tableau de performance")
             st.caption(
                 f"Résultats réalisés uniquement · Risque simulé de {risk_per_trade:.2f} $ par trade "
