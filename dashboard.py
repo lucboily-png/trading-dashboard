@@ -2,20 +2,17 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import streamlit.components.v1 as components
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
-import oandapyV20.endpoints.accounts as oanda_accounts
-import oandapyV20.endpoints.transactions as oanda_transactions
-import oandapyV20.endpoints.trades as oanda_trades
+from oandapyV20.endpoints.transactions import TransactionList
 from streamlit_autorefresh import st_autorefresh
 import smtplib
 import requests
 import hashlib
 import json
-import re
 from pathlib import Path
 from email.mime.text import MIMEText
 
@@ -154,172 +151,183 @@ def _signal_identity(pair, timeframe, fib, fib_mode):
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mode):
-    """Enregistre un ordre limite virtuel PENDING, sans simuler une entrée immédiate."""
+def create_pending_setup(pair, timeframe, setup, candle_time, trade_plan, fib_mode):
+    """Stocke une configuration en attente; aucun trade n'est encore ouvert."""
     if not supabase_configured():
-        return False, "Supabase non configuré."
+        return False, "Supabase requis pour conserver une configuration en attente."
     if not trade_plan or not setup.get("fib"):
-        return False, "Aucun plan complet à enregistrer."
+        return False, "Configuration incomplète."
+
     fib = setup["fib"]
-    # Accepte une heure locale naive ou déjà timezone-aware sans provoquer
-    # l'erreur "Cannot localize tz-aware Timestamp".
-    candle_stamp = pd.Timestamp(str(candle_time).replace(" NY", ""))
-    if candle_stamp.tzinfo is None:
-        candle_stamp = candle_stamp.tz_localize("America/New_York")
-    else:
-        candle_stamp = candle_stamp.tz_convert("America/New_York")
-    candle_iso = candle_stamp.isoformat()
+    candle_iso = pd.Timestamp(
+        candle_time.replace(" NY", "")
+    ).tz_localize("America/New_York").isoformat()
     signal_key = _signal_identity(pair, timeframe, fib, fib_mode.upper())
-    signal_time_iso = datetime.now(pytz.UTC).isoformat()
+    metadata = {
+        "phase": "WAIT_RETEST",
+        "trigger_level": float(setup["trigger_level"]),
+        "zone_low": float(fib["zone_low"]),
+        "zone_high": float(fib["zone_high"]),
+        "atr": float(fib["atr"]),
+        "endpoint_price": float(fib["endpoint"]["price"]),
+        "origin_price": float(fib["origin"]["price"]),
+        "origin_time": str(fib["origin"]["time"]),
+        "endpoint_time": str(fib["endpoint"]["time"]),
+        "manual": bool(fib.get("manual", False)),
+        "retest_seen": False,
+        "retest_high": None,
+        "retest_low": None,
+        "retest_time": None,
+        "bars_elapsed": 0,
+        "last_processed_candle": candle_iso,
+        "max_wait_candles": 6,
+        "retest_tolerance_atr": 0.15,
+        "max_entry_extension_atr": 0.25,
+        "fib_mode": fib_mode.upper(),
+    }
     payload = {
-        "signal_key": signal_key, "instrument": pair, "timeframe": timeframe,
-        "direction": fib["direction"], "fib_mode": fib_mode.upper(),
-        "signal_time": signal_time_iso, "candle_time": candle_iso,
-        "entry_price": float(trade_plan["entry"]), "stop_loss": float(trade_plan["stop_loss"]),
-        "take_profit": float(trade_plan["take_profit"]), "rr": float(trade_plan["rr"]),
+        "signal_key": signal_key,
+        "instrument": pair,
+        "timeframe": timeframe,
+        "direction": fib["direction"],
+        "fib_mode": fib_mode.upper(),
+        "signal_time": datetime.now(pytz.UTC).isoformat(),
+        "candle_time": candle_iso,
+        # Ces prix sont provisoires et le statut PENDING empêche leur suivi comme trade.
+        "entry_price": float(trade_plan["entry"]),
+        "stop_loss": float(trade_plan["stop_loss"]),
+        "take_profit": float(trade_plan["take_profit"]),
+        "rr": float(trade_plan["rr"]),
         "status": "PENDING",
-        "notes": "Ordre limite virtuel en attente d'un retour dans la zone Fibonacci; aucun ordre OANDA envoyé.",
+        "notes": json.dumps(metadata, ensure_ascii=False),
     }
     result = supabase_request(
-        "POST", payload=payload, params={"on_conflict": "signal_key"},
+        "POST", payload=payload,
+        params={"on_conflict": "signal_key"},
         prefer="resolution=ignore-duplicates,return=representation",
     )
-    if result:
-        return True, "Ordre limite virtuel en attente."
+    return bool(result), "Configuration en attente enregistrée." if result else "Configuration déjà enregistrée."
 
-    # Met à jour un ancien dossier PENDING portant la même identité de swing.
-    existing = supabase_request(
-        "GET", params={"select": "id,status", "signal_key": f"eq.{signal_key}", "limit": "1"}
+
+def activate_pending_setup(pending, confirmation_candle, trade_plan):
+    """Transforme une configuration PENDING en trade OPEN après le retest confirmé."""
+    candle_iso = pd.Timestamp(confirmation_candle["time"]).isoformat()
+    supabase_request(
+        "PATCH",
+        params={"id": f"eq.{pending['id']}", "status": "eq.PENDING"},
+        payload={
+            "status": "OPEN",
+            "candle_time": candle_iso,
+            "entry_price": float(trade_plan["entry"]),
+            "stop_loss": float(trade_plan["stop_loss"]),
+            "take_profit": float(trade_plan["take_profit"]),
+            "rr": float(trade_plan["rr"]),
+            "notes": "Entrée confirmée après retest et nouvelle clôture de confirmation. Trade virtuel; aucun ordre OANDA envoyé.",
+            "updated_at": datetime.now(pytz.UTC).isoformat(),
+        },
+        prefer="return=minimal",
     )
-    if existing:
-        previous = existing[0]
-        if str(previous.get("status", "")).upper() == "PENDING":
-            supabase_request(
-                "PATCH", params={"id": f"eq.{previous['id']}"}, payload=payload,
-                prefer="return=minimal",
-            )
-            return True, "Ordre limite en attente actualisé."
-        return False, f"Signal déjà enregistré ({previous.get('status', 'statut inconnu')})."
-    return False, "Signal déjà enregistré."
+
+
+def update_pending_setup(pending_id, metadata, status="PENDING", note=None):
+    payload = {
+        "status": status,
+        "notes": note if note is not None else json.dumps(metadata, ensure_ascii=False),
+        "updated_at": datetime.now(pytz.UTC).isoformat(),
+    }
+    supabase_request(
+        "PATCH",
+        params={"id": f"eq.{pending_id}", "status": "eq.PENDING"},
+        payload=payload,
+        prefer="return=minimal",
+    )
+
+
+def load_pending_setups(pair, timeframe):
+    if not supabase_configured():
+        return []
+    return supabase_request(
+        "GET",
+        params={
+            "select": "*",
+            "status": "eq.PENDING",
+            "instrument": f"eq.{pair}",
+            "timeframe": f"eq.{timeframe}",
+            "order": "candle_time.asc",
+        },
+    )
 
 
 def monitor_virtual_trades(pair, timeframe, closed_df):
-    """Gère les ordres limites PENDING puis suit les trades OPEN sur chandelles clôturées."""
+    """Vérifie les chandelles clôturées après le signal et ferme les trades virtuels."""
     if not supabase_configured() or closed_df.empty:
         return
-    candles = closed_df.copy()
-    candles["_utc_time"] = pd.to_datetime(candles["time"], utc=True)
-    max_wait = 4 if timeframe == "M30" else 6
     trades = supabase_request(
-        "GET", params={
-            "select": "*", "status": "in.(PENDING,OPEN)",
-            "instrument": f"eq.{pair}", "timeframe": f"eq.{timeframe}",
+        "GET",
+        params={
+            "select": "*",
+            "status": "eq.OPEN",
+            "instrument": f"eq.{pair}",
+            "timeframe": f"eq.{timeframe}",
             "order": "candle_time.asc",
-        }
+        },
     )
     if not trades:
         return
 
+    candles = closed_df.copy()
+    candles["_utc_time"] = pd.to_datetime(candles["time"], utc=True)
     for trade in trades:
-        direction = trade["direction"]
-        entry = float(trade["entry_price"])
-        stop = float(trade["stop_loss"])
-        target = float(trade["take_profit"])
         signal_candle_time = pd.to_datetime(trade["candle_time"], utc=True)
-        signal_time = pd.to_datetime(trade.get("signal_time") or trade["candle_time"], utc=True)
-        start_time = max(signal_candle_time, signal_time)
-        later = candles[candles["_utc_time"] > start_time]
+        later = candles[candles["_utc_time"] > signal_candle_time]
+        for _, candle in later.iterrows():
+            high = float(candle["high"])
+            low = float(candle["low"])
+            direction = trade["direction"]
+            stop = float(trade["stop_loss"])
+            target = float(trade["take_profit"])
 
-        if str(trade.get("status", "")).upper() == "PENDING":
-            if "Ordre limite virtuel" not in str(trade.get("notes", "")):
-                supabase_request(
-                    "PATCH", params={"id": f"eq.{trade['id']}", "status": "eq.PENDING"},
-                    payload={"status": "EXPIRED", "notes": "Ancienne configuration PENDING expirée; elle ne correspond pas au nouveau suivi par entrée limite.",
-                             "updated_at": datetime.now(pytz.UTC).isoformat()},
-                    prefer="return=minimal",
-                )
-                continue
-            for age, (_, candle) in enumerate(later.iterrows(), start=1):
-                high, low = float(candle["high"]), float(candle["low"])
-                if direction == "BULL":
-                    entry_touched = low <= entry
-                    invalid_before_fill = low <= stop
-                    target_passed = high >= target
-                else:
-                    entry_touched = high >= entry
-                    invalid_before_fill = high >= stop
-                    target_passed = low <= target
-
-                # Si une même chandelle touche l'entrée et une borne de sortie,
-                # l'ordre intrachandelle est inconnu : ne pas inventer un résultat.
-                if entry_touched and (invalid_before_fill or target_passed):
-                    supabase_request(
-                        "PATCH", params={"id": f"eq.{trade['id']}", "status": "eq.PENDING"},
-                        payload={"status": "AMBIGUOUS", "close_time": pd.Timestamp(candle["time"]).isoformat(),
-                                 "notes": "Entrée limite et niveau de sortie touchés dans la même chandelle; ordre intrachandelle inconnu.",
-                                 "updated_at": datetime.now(pytz.UTC).isoformat()},
-                        prefer="return=minimal",
-                    )
-                    break
-                if invalid_before_fill or target_passed:
-                    supabase_request(
-                        "PATCH", params={"id": f"eq.{trade['id']}", "status": "eq.PENDING"},
-                        payload={"status": "EXPIRED", "close_time": pd.Timestamp(candle["time"]).isoformat(),
-                                 "notes": "Configuration expirée avant le déclenchement de l'entrée limite (SL ou objectif atteint sans remplissage).",
-                                 "updated_at": datetime.now(pytz.UTC).isoformat()},
-                        prefer="return=minimal",
-                    )
-                    break
-                if entry_touched:
-                    fill_time = pd.Timestamp(candle["time"]).isoformat()
-                    supabase_request(
-                        "PATCH", params={"id": f"eq.{trade['id']}", "status": "eq.PENDING"},
-                        payload={"status": "OPEN", "signal_time": fill_time,
-                                 "notes": "Entrée limite virtuelle déclenchée; suivi SL/TP à partir de la chandelle clôturée suivante.",
-                                 "updated_at": datetime.now(pytz.UTC).isoformat()},
-                        prefer="return=minimal",
-                    )
-                    break
-                if age >= max_wait:
-                    supabase_request(
-                        "PATCH", params={"id": f"eq.{trade['id']}", "status": "eq.PENDING"},
-                        payload={"status": "EXPIRED", "close_time": pd.Timestamp(candle["time"]).isoformat(),
-                                 "notes": f"Ordre limite expiré après {max_wait} chandelles sans retour au prix d'entrée.",
-                                 "updated_at": datetime.now(pytz.UTC).isoformat()},
-                        prefer="return=minimal",
-                    )
-                    break
-            continue
-
-        # Trade OPEN : ignorer la chandelle qui contient le remplissage de l'entrée.
-        later_open = candles[candles["_utc_time"] > start_time]
-        for _, candle in later_open.iterrows():
-            high, low = float(candle["high"]), float(candle["low"])
             if direction == "BULL":
-                hit_stop, hit_target = low <= stop, high >= target
+                hit_stop = low <= stop
+                hit_target = high >= target
             else:
-                hit_stop, hit_target = high >= stop, low <= target
+                hit_stop = high >= stop
+                hit_target = low <= target
+
             if not hit_stop and not hit_target:
                 continue
+
             close_time = pd.Timestamp(candle["time"]).isoformat()
             if hit_stop and hit_target:
-                status, close_price, result_r = "AMBIGUOUS", None, None
+                status = "AMBIGUOUS"
+                close_price = None
+                result_r = None
                 note = "TP et SL touchés dans la même chandelle; ordre intrachandelle inconnu."
             elif hit_target:
-                status, close_price, result_r = "WIN", target, float(trade["rr"])
+                status = "WIN"
+                close_price = target
+                result_r = float(trade["rr"])
                 note = "Take-profit atteint."
             else:
-                status, close_price, result_r = "LOSS", stop, -1.0
+                status = "LOSS"
+                close_price = stop
+                result_r = -1.0
                 note = "Stop-loss atteint."
+
             supabase_request(
-                "PATCH", params={"id": f"eq.{trade['id']}", "status": "eq.OPEN"},
-                payload={"status": status, "close_price": close_price, "close_time": close_time,
-                         "result_r": result_r, "notes": note,
-                         "updated_at": datetime.now(pytz.UTC).isoformat()},
+                "PATCH",
+                params={"id": f"eq.{trade['id']}", "status": "eq.OPEN"},
+                payload={
+                    "status": status,
+                    "close_price": close_price,
+                    "close_time": close_time,
+                    "result_r": result_r,
+                    "notes": note,
+                    "updated_at": datetime.now(pytz.UTC).isoformat(),
+                },
                 prefer="return=minimal",
             )
             break
-
 
 def load_virtual_trade_stats():
     """Charge l'historique des trades virtuels depuis Supabase."""
@@ -330,154 +338,16 @@ def load_virtual_trade_stats():
 
 
 ACCESS_TOKEN = get_secret("OANDA_ACCESS_TOKEN")
-# Compte Practice explicitement demandé par l’utilisateur (Good one).
-ACCOUNT_ID = "101-002-37205058-004"
+ACCOUNT_ID = get_secret("OANDA_ACCOUNT_ID")
 
 if not ACCESS_TOKEN or not ACCOUNT_ID:
     st.error(
-        "Configuration OANDA manquante. Ajoute OANDA_ACCESS_TOKEN dans les Secrets "
-        "de ton application Streamlit."
+        "Configuration OANDA manquante. Ajoute OANDA_ACCESS_TOKEN et "
+        "OANDA_ACCOUNT_ID dans les Secrets de ton application Streamlit."
     )
     st.stop()
 
 client = API(access_token=ACCESS_TOKEN, environment="practice")
-
-
-def load_oanda_real_performance(days=90):
-    """Charge les transactions et positions réelles du compte OANDA Practice."""
-    # Vérifie que le jeton API Practice donne bien accès au compte demandé.
-    account_list_request = oanda_accounts.AccountList()
-    client.request(account_list_request)
-    authorized_accounts = account_list_request.response.get("accounts", []) or []
-    authorized_ids = [str(item.get("id", "")) for item in authorized_accounts]
-    if ACCOUNT_ID not in authorized_ids:
-        raise RuntimeError(
-            f"Le jeton OANDA Practice configuré n'a pas accès au compte {ACCOUNT_ID}. "
-            f"Comptes autorisés par ce jeton : {', '.join(authorized_ids) or 'aucun'}. "
-            "Vérifie le jeton API Practice OANDA et régénère-le si ce compte a été ajouté récemment."
-        )
-
-    now_utc = pd.Timestamp.now(tz="UTC")
-    start_utc = now_utc - pd.Timedelta(days=days)
-
-    summary_request = oanda_accounts.AccountSummary(ACCOUNT_ID)
-    client.request(summary_request)
-    summary = summary_request.response.get("account", {})
-    account_currency = summary.get("currency", "USD")
-
-    transaction_request = oanda_transactions.TransactionList(
-        ACCOUNT_ID,
-        params={
-            "from": start_utc.strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
-            "to": now_utc.strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
-            "pageSize": 1000,
-        },
-    )
-    client.request(transaction_request)
-    transaction_response = transaction_request.response or {}
-
-    # IMPORTANT : TransactionList ne renvoie PAS les transactions elles-mêmes.
-    # OANDA renvoie une liste d'URL /transactions/idrange dans "pages".
-    # Il faut appeler TransactionIDRange pour chaque intervalle afin de récupérer
-    # les objets transactions (ORDER_FILL, TRADE_CLOSE, etc.).
-    transactions_list = []
-    page_urls = transaction_response.get("pages", []) or []
-    page_errors = []
-    for page_url in page_urls:
-        match = re.search(r"[?&]from=(\d+).*?[&]to=(\d+)", str(page_url))
-        if not match:
-            match = re.search(r"[?&]to=(\d+).*?[&]from=(\d+)", str(page_url))
-            if match:
-                from_id, to_id = match.group(2), match.group(1)
-            else:
-                page_errors.append(f"URL de page OANDA non reconnue : {page_url}")
-                continue
-        else:
-            from_id, to_id = match.group(1), match.group(2)
-
-        try:
-            page_request = oanda_transactions.TransactionIDRange(
-                ACCOUNT_ID,
-                params={"from": from_id, "to": to_id},
-            )
-            client.request(page_request)
-            transactions_list.extend(
-                (page_request.response or {}).get("transactions", []) or []
-            )
-        except Exception as page_exc:
-            page_errors.append(
-                f"Échec récupération transactions {from_id}-{to_id} : {page_exc}"
-            )
-
-    # Déduplique par ID au cas où deux intervalles se chevaucheraient.
-    unique_transactions = {}
-    for tx in transactions_list:
-        tx_id = str(tx.get("id", ""))
-        if tx_id:
-            unique_transactions[tx_id] = tx
-    transactions_list = list(unique_transactions.values())
-    transactions_list.sort(key=lambda item: int(item.get("id", 0) or 0))
-
-    fills = []
-    for tx in transactions_list:
-        if str(tx.get("type", "")).upper() != "ORDER_FILL":
-            continue
-        timestamp = pd.to_datetime(tx.get("time"), utc=True, errors="coerce")
-        if pd.isna(timestamp):
-            continue
-
-        # OANDA fournit les montants signés : le financement et la commission
-        # sont ajoutés au P/L de la transaction pour obtenir le net du compte.
-        pl = float(tx.get("pl", 0) or 0)
-        financing = float(tx.get("financing", 0) or 0)
-        commission = float(tx.get("commission", 0) or 0)
-        fills.append({
-            "time_utc": timestamp,
-            "instrument": tx.get("instrument", "Autre"),
-            "pl": pl,
-            "financing": financing,
-            "commission": commission,
-            "net": pl + financing + commission,
-            "transaction_id": tx.get("id"),
-            "reason": tx.get("reason", ""),
-        })
-
-    fills_df = pd.DataFrame(fills)
-    if not fills_df.empty:
-        fills_df["time_quebec"] = fills_df["time_utc"].dt.tz_convert(
-            "America/Toronto"
-        )
-        fills_df["date_quebec"] = fills_df["time_quebec"].dt.strftime("%Y-%m-%d")
-
-    open_request = oanda_trades.OpenTrades(ACCOUNT_ID)
-    client.request(open_request)
-    open_trades = open_request.response.get("trades", []) or []
-
-    open_rows = []
-    for trade in open_trades:
-        open_rows.append({
-            "Instrument": trade.get("instrument", "Autre"),
-            "Direction": "ACHAT" if float(trade.get("currentUnits", 0) or 0) > 0 else "VENTE",
-            "Unités": float(trade.get("currentUnits", 0) or 0),
-            "Prix d'entrée": float(trade.get("price", 0) or 0),
-            "P/L latent": float(trade.get("unrealizedPL", 0) or 0),
-            "Ouvert le": trade.get("openTime", ""),
-        })
-    open_df = pd.DataFrame(open_rows)
-
-    return {
-        "account_id": ACCOUNT_ID,
-        "currency": account_currency,
-        "summary": summary,
-        "fills": fills_df,
-        "open_trades": open_df,
-        "transactions_count": len(transactions_list),
-        "transaction_pages": len(page_urls),
-        "transaction_page_errors": page_errors,
-        "transaction_api_count": int(transaction_response.get("count", 0) or 0),
-    }
-
-
 
 VOICE_STRONG_BULL = (
     "https://cdn.pixabay.com/download/audio/2023/03/22/"
@@ -532,51 +402,29 @@ def send_email_alert(subject, body):
 
 # SIDEBAR
 st.sidebar.title("Configuration des instruments")
-# Les symboles sont ceux utilisés par OANDA. La disponibilité de BTC_USD
-# dépend du type de compte et des instruments autorisés chez OANDA.
-pairs = [None, "SPX500_USD", "XAU_USD", "EUR_USD", "BTC_USD"]
-pair_labels = {
-    "SPX500_USD": "SPX500 — S&P 500",
-    "XAU_USD": "XAU/USD — Or",
-    "EUR_USD": "EUR/USD — Euro / Dollar",
-    "BTC_USD": "BTC/USD — Bitcoin",
-}
+pairs = ["SPX500_USD", "XAU_USD"]
 timeframes = ["M1", "M5", "M15", "M30", "H1", "H4", "D", "W"]
-# Huit emplacements permettent de surveiller quatre marchés en M30 et M5.
-default_configs = [
-    ("SPX500_USD", "M30"), ("SPX500_USD", "M5"),
-    ("XAU_USD", "M30"), ("XAU_USD", "M5"),
-    ("EUR_USD", "M30"), ("EUR_USD", "M5"),
-    (None, "M30"), (None, "M5"),
-]
 instruments_config = []
 
-for i, (default_pair, default_timeframe) in enumerate(default_configs):
-    default_pair_index = pairs.index(default_pair)
-    default_timeframe_index = timeframes.index(default_timeframe)
+for i in range(4):
+    # Ordre par défaut : SPX M30, SPX M5, XAU M30, XAU M5.
+    default_pair_index = 0 if i < 2 else 1
+    default_timeframe_index = 3 if i in (0, 2) else 1
     pair_key = f"pair_{i}"
     timeframe_key = f"timeframe_{i}"
     if st.session_state.get(pair_key) not in pairs:
-        st.session_state[pair_key] = default_pair
+        st.session_state[pair_key] = pairs[default_pair_index]
     if st.session_state.get(timeframe_key) not in timeframes:
-        st.session_state[timeframe_key] = default_timeframe
+        st.session_state[timeframe_key] = timeframes[default_timeframe_index]
     pair = st.sidebar.selectbox(
         f"Instrument {i + 1}", pairs,
-        index=default_pair_index,
-        format_func=lambda value: "— Désactivé —" if value is None else pair_labels.get(value, value),
-        key=pair_key
+        index=default_pair_index, key=pair_key
     )
     timeframe = st.sidebar.selectbox(
         f"Timeframe {i + 1}", timeframes,
         index=default_timeframe_index, key=timeframe_key
     )
-    if pair is not None:
-        instruments_config.append({"pair": pair, "timeframe": timeframe})
-
-st.sidebar.caption(
-    "SPX500, XAU/USD et EUR/USD sont préchargés en M30/M5. "
-    "Les deux emplacements libres peuvent servir à ajouter BTC/USD ou un autre timeframe."
-)
+    instruments_config.append({"pair": pair, "timeframe": timeframe})
 
 mute_alerts = st.sidebar.checkbox("Désactiver les alertes vocales", value=False)
 email_alerts_enabled = st.sidebar.checkbox("Activer les alertes par courriel", value=True)
@@ -624,87 +472,6 @@ def get_data(pair, granularity="M30", count=300):
     df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert("America/New_York")
     return df
 
-
-def get_m30_market_context(pair):
-    """Combine tendance EMA/DI et structure de marché sur M30 clôturé."""
-    raw_m30 = get_data(pair, "M30")
-    neutral = {"bias": "NEUTRAL", "structure_bias": "NEUTRAL",
-               "strength": "Indisponible", "adx": None}
-    if raw_m30.empty:
-        return {**neutral, "details": "Données M30 indisponibles : aucun signal directionnel validé."}
-
-    closed_m30 = raw_m30[raw_m30["complete"]].copy()
-    if len(closed_m30) < 210:
-        return {**neutral, "strength": "Données insuffisantes",
-                "details": "Au moins 210 chandelles M30 clôturées sont nécessaires."}
-
-    m30 = add_indicators(closed_m30).reset_index(drop=True)
-    last = m30.iloc[-1]
-    values = [last.get("close"), last.get("EMA50"), last.get("EMA100"),
-              last.get("EMA200"), last.get("+DI14"), last.get("-DI14"),
-              last.get("ADX14")]
-    if any(pd.isna(value) for value in values):
-        return {**neutral, "details": "Indicateurs M30 incomplets : aucun signal directionnel validé."}
-
-    close = float(last["close"])
-    ema50, ema100, ema200 = (float(last[k]) for k in ("EMA50", "EMA100", "EMA200"))
-    plus_di, minus_di = float(last["+DI14"]), float(last["-DI14"])
-    adx = float(last["ADX14"])
-
-    if close > ema200 and ema50 > ema100 and plus_di > minus_di:
-        trend_bias = "BULL"
-        trend_details = "Tendance EMA/DI haussière."
-    elif close < ema200 and ema50 < ema100 and minus_di > plus_di:
-        trend_bias = "BEAR"
-        trend_details = "Tendance EMA/DI baissière."
-    else:
-        trend_bias = "NEUTRAL"
-        trend_details = "Tendance EMA/DI non alignée."
-
-    # Structure sans anticipation : seuls les pivots ayant leurs 3 chandelles
-    # de confirmation à droite sont retenus.
-    pivot_window = 3
-    recent = m30.tail(120).reset_index(drop=True)
-    pivot_highs, pivot_lows = [], []
-    for i in range(pivot_window, len(recent) - pivot_window):
-        row = recent.iloc[i]
-        left = recent.iloc[i-pivot_window:i]
-        right = recent.iloc[i+1:i+pivot_window+1]
-        high = float(row["high"])
-        low = float(row["low"])
-        if high > float(left["high"].max()) and high >= float(right["high"].max()):
-            pivot_highs.append(high)
-        if low < float(left["low"].min()) and low <= float(right["low"].min()):
-            pivot_lows.append(low)
-
-    structure_bias = "NEUTRAL"
-    if len(pivot_highs) >= 2 and len(pivot_lows) >= 2:
-        lower_highs = pivot_highs[-1] < pivot_highs[-2]
-        lower_lows = pivot_lows[-1] < pivot_lows[-2]
-        higher_highs = pivot_highs[-1] > pivot_highs[-2]
-        higher_lows = pivot_lows[-1] > pivot_lows[-2]
-        if lower_highs and lower_lows:
-            structure_bias = "BEAR"
-        elif higher_highs and higher_lows:
-            structure_bias = "BULL"
-
-    # Pour autoriser un signal M30, la tendance et la structure doivent être
-    # d'accord. En cas de désaccord ou de structure indécise, on reste neutre.
-    if trend_bias == structure_bias and trend_bias in ("BULL", "BEAR"):
-        bias = trend_bias
-        details = f"{trend_details} Structure M30 {('haussière' if bias == 'BULL' else 'baissière')} confirmée : " \
-                  f"{('sommets et creux ascendants' if bias == 'BULL' else 'sommets et creux descendants')}."
-    else:
-        bias = "NEUTRAL"
-        structure_text = {"BULL": "structure haussière", "BEAR": "structure baissière",
-                          "NEUTRAL": "structure indécise"}[structure_bias]
-        details = (f"{trend_details} {structure_text.capitalize()} : tendance et structure "
-                   "ne sont pas suffisamment alignées. Signal M30 bloqué par prudence.")
-
-    strength = "Faible" if adx < 15 else ("Modérée" if adx < 25 else "Forte")
-    return {"bias": bias, "structure_bias": structure_bias, "trend_bias": trend_bias,
-            "strength": strength, "adx": adx, "details": details,
-            "candle_time": str(last["time"])}
 
 
 # INDICATORS
@@ -859,7 +626,6 @@ def evaluate_fibonacci_setup(
     df,
     current_price=None,
     fib_override=None,
-    timeframe="M5",
     max_close_extension_atr=0.50,
     max_live_extension_atr=0.35,
     max_trigger_wait_candles=3
@@ -898,99 +664,57 @@ def evaluate_fibonacci_setup(
     in_zone = zone_low <= live <= zone_high
 
     if direction == "BULL":
-        label = ("🟢 ACHAT — REJET FIBONACCI M30 CONFIRMÉ" if timeframe == "M30"
-                 else "🟢 ACHAT — CASSURE DU REJET CONFIRMÉE")
+        label = "🟢 ACHAT — CASSURE DU REJET CONFIRMÉE"
         wait_label = "🟡 Zone d'achat Fibonacci — attente du rejet et de la cassure"
         zone_name = "ZONE D'ACHAT"
-        if timeframe == "M30":
-            # M30 : accepte un rejet haussier depuis le bas de la zone même si
-            # la clôture reste à l'intérieur du Fibonacci. La cassure du sommet
-            # de cette chandelle par la chandelle suivante sera obligatoire.
-            rejection_condition = lambda row: (
-                float(row["close"]) > float(row["open"])
-                and float(row["close"]) > zone_low
-                and (float(row["close"]) - float(row["low"]))
-                    >= 0.55 * max(float(row["high"]) - float(row["low"]), 1e-12)
-            )
-        else:
-            rejection_condition = lambda row: (
-                float(row["close"]) > float(row["open"])
-                and float(row["close"]) > zone_high
-            )
+        rejection_condition = lambda row: (
+            float(row["close"]) > float(row["open"])
+            and float(row["close"]) > zone_high
+        )
         trigger_broken = lambda row, rejection: (
             float(row["close"]) > float(rejection["high"])
         )
         details = (
-            "Rejet haussier M30 détecté dans la zone 50–61,8 %. Le signal sera confirmé "
-            "uniquement si une chandelle suivante clôture au-dessus du sommet du rejet."
-            if timeframe == "M30" else
             "Après le retour dans la zone 50–61,8 %, le système attend une "
             "chandelle de rejet haussière, puis la clôture d'une chandelle "
             "au-dessus de son plus haut."
         )
     else:
-        label = ("🔴 VENTE — REJET FIBONACCI M30 CONFIRMÉ" if timeframe == "M30"
-                 else "🔴 VENTE — CASSURE DU REJET CONFIRMÉE")
+        label = "🔴 VENTE — CASSURE DU REJET CONFIRMÉE"
         wait_label = "🟡 Zone de vente Fibonacci — attente du rejet et de la cassure"
         zone_name = "ZONE DE VENTE"
-        if timeframe == "M30":
-            # M30 : accepte un rejet baissier depuis le haut de la zone même si
-            # la clôture reste à l'intérieur du Fibonacci. La cassure du creux
-            # de cette chandelle par la chandelle suivante sera obligatoire.
-            rejection_condition = lambda row: (
-                float(row["close"]) < float(row["open"])
-                and float(row["close"]) < zone_high
-                and (float(row["high"]) - float(row["close"]))
-                    >= 0.55 * max(float(row["high"]) - float(row["low"]), 1e-12)
-            )
-        else:
-            rejection_condition = lambda row: (
-                float(row["close"]) < float(row["open"])
-                and float(row["close"]) < zone_low
-            )
+        rejection_condition = lambda row: (
+            float(row["close"]) < float(row["open"])
+            and float(row["close"]) < zone_low
+        )
         trigger_broken = lambda row, rejection: (
             float(row["close"]) < float(rejection["low"])
         )
         details = (
-            "Rejet baissier M30 détecté dans la zone 50–61,8 %. Le signal sera confirmé "
-            "uniquement si une chandelle suivante clôture sous le creux du rejet."
-            if timeframe == "M30" else
             "Après le retour dans la zone 50–61,8 %, le système attend une "
             "chandelle de rejet baissière, puis la clôture d'une chandelle "
             "sous son plus bas."
         )
 
-    # M30 et M5 utilisent maintenant une confirmation en deux temps :
-    # 1) une chandelle rejette la zone Fibonacci dans le bon sens;
-    # 2) une chandelle clôturée suivante casse le haut/bas de cette chandelle.
-    # En M30, le rejet peut clôturer à l'intérieur de la zone : cela permet de
-    # détecter un rebond propre depuis le bord 61,8 % sans exiger une clôture
-    # déjà trop éloignée du niveau de retracement.
-    last_overlaps_zone = (
-        float(last["low"]) <= zone_high and float(last["high"]) >= zone_low
-    )
+    # Cherche la dernière chandelle de rejet clôturée AVANT la dernière chandelle.
+    # La dernière chandelle doit ensuite casser son extrême dans le bon sens.
+    prior = data.iloc[touch_start:-1]
     rejection = None
     rejection_index = None
+    for idx in range(len(prior) - 1, -1, -1):
+        row = prior.iloc[idx]
+        overlaps_zone = (
+            float(row["low"]) <= zone_high and float(row["high"]) >= zone_low
+        )
+        if overlaps_zone and rejection_condition(row):
+            rejection = row
+            rejection_index = touch_start + idx
+            break
+
     confirmed = False
     trigger_level = None
     candles_waited = None
-
-    # Cherche la dernière chandelle de rejet clôturée AVANT la dernière chandelle.
-    # La dernière chandelle doit ensuite casser son extrême dans le bon sens,
-    # y compris en M30 : aucune alerte sur la seule couleur d'une chandelle.
-    prior = data.iloc[touch_start:-1]
-    if not confirmed:
-        for idx in range(len(prior) - 1, -1, -1):
-            row = prior.iloc[idx]
-            overlaps_zone = (
-                float(row["low"]) <= zone_high and float(row["high"]) >= zone_low
-            )
-            if overlaps_zone and rejection_condition(row):
-                rejection = row
-                rejection_index = touch_start + idx
-                break
-
-    if not confirmed and rejection is not None:
+    if rejection is not None:
         candles_waited = len(data) - 1 - rejection_index
         if 1 <= candles_waited <= max_trigger_wait_candles:
             confirmed = trigger_broken(last, rejection)
@@ -1027,9 +751,9 @@ def evaluate_fibonacci_setup(
             return {
                 "state": direction + "_TOO_LATE",
                 "label": (
-                    "⚠️ VENTE — CONFIRMATION TROP ÉLOIGNÉE, ENTRÉE TARDIVE"
+                    "⚠️ VENTE — CASSURE CONFIRMÉE, ENTRÉE TROP TARDIVE"
                     if direction == "BEAR"
-                    else "⚠️ ACHAT — CONFIRMATION TROP ÉLOIGNÉE, ENTRÉE TARDIVE"
+                    else "⚠️ ACHAT — CASSURE CONFIRMÉE, ENTRÉE TROP TARDIVE"
                 ),
                 "color": "orange",
                 "details": "La cassure est confirmée, mais le prix est déjà trop "
@@ -1087,58 +811,57 @@ def evaluate_fibonacci_setup(
 
 
 def build_trade_plan(setup, current_price, min_rr=1.5, stop_buffer_atr=0.20):
-    """Construit un plan à entrée limite au milieu de la zone Fibonacci 50–61,8 %."""
+    """Construit un plan indicatif uniquement après confirmation et filtre anti-retard.
+
+    Entrée = prix médian courant observé dans la chandelle en formation.
+    SL = au-delà du bord externe de la zone Fibonacci + marge ATR.
+    TP = extrémité du swing initial. Le plan est rejeté si le RR est inférieur
+    au minimum ou si le prix a déjà dépassé la cible.
+    """
     if setup.get("state") not in ("BULL_CONFIRMED", "BEAR_CONFIRMED"):
         return None, "Aucun plan : attendre une confirmation Fibonacci non tardive."
+
     fib = setup.get("fib")
     if not fib or current_price is None:
         return None, "Aucun plan : prix courant ou Fibonacci indisponible."
 
-    zone_low, zone_high = float(fib["zone_low"]), float(fib["zone_high"])
-    entry = (zone_low + zone_high) / 2.0
+    entry = float(current_price)
     atr = float(fib["atr"])
     buffer = atr * stop_buffer_atr
     target = float(fib["endpoint"]["price"])
-    live = float(current_price)
 
     if fib["direction"] == "BEAR":
-        stop = zone_high + buffer
-        # Une vente limite au milieu de la zone n'est pertinente que si le
-        # prix est encore sous l'entrée. Sinon, le marché a déjà rejoint ou
-        # dépassé le niveau : ne pas créer un PENDING artificiel.
-        if live >= entry:
-            return None, "Entrée vente dépassée : le prix est déjà au niveau ou au-dessus de l'entrée limite. Attendre une nouvelle configuration."
-        if live <= target:
-            return None, "Signal trop tardif : l'objectif est déjà atteint. Ne pas poursuivre le prix."
-        if live >= stop:
-            return None, "Configuration invalidée : le prix a déjà dépassé le stop prévu."
+        stop = float(fib["zone_high"]) + buffer
         if not (target < entry < stop):
-            return None, "Aucun plan : niveaux Fibonacci invalides."
-        risk, reward, side = stop - entry, entry - target, "VENTE"
+            return None, "Aucun plan : le prix est déjà au niveau de la cible ou la structure risque/rendement est invalide."
+        risk = stop - entry
+        reward = entry - target
+        side = "VENTE"
     else:
-        stop = zone_low - buffer
-        # Même protection pour un achat : éviter un ordre limite au-dessus
-        # du marché lorsque le prix a déjà traversé le niveau d'entrée.
-        if live <= entry:
-            return None, "Entrée achat dépassée : le prix est déjà au niveau ou sous l'entrée limite. Attendre une nouvelle configuration."
-        if live >= target:
-            return None, "Signal trop tardif : l'objectif est déjà atteint. Ne pas poursuivre le prix."
-        if live <= stop:
-            return None, "Configuration invalidée : le prix a déjà dépassé le stop prévu."
+        stop = float(fib["zone_low"]) - buffer
         if not (stop < entry < target):
-            return None, "Aucun plan : niveaux Fibonacci invalides."
-        risk, reward, side = entry - stop, target - entry, "ACHAT"
+            return None, "Aucun plan : le prix est déjà au niveau de la cible ou la structure risque/rendement est invalide."
+        risk = entry - stop
+        reward = target - entry
+        side = "ACHAT"
 
     rr_value = reward / risk if risk > 0 else 0.0
     if rr_value < min_rr:
-        return None, (f"Aucun plan proposé : le rendement jusqu'à l'extrémité du swing "
-                      f"n'offre que 1:{rr_value:.2f}, sous le minimum de 1:{min_rr:.2f}.")
+        return None, (
+            f"Aucun plan proposé : le rendement jusqu'à l'extrémité du swing "
+            f"n'offre que 1:{rr_value:.2f}, sous le minimum de 1:{min_rr:.2f}."
+        )
+
     return {
-        "side": side, "entry": entry, "stop_loss": stop, "take_profit": target,
-        "rr": rr_value, "risk_distance": risk, "reward_distance": reward,
-        "buffer": buffer, "entry_type": "LIMIT", "zone_low": zone_low,
-        "zone_high": zone_high,
-    }, "Ordre limite indicatif au milieu de la zone Fibonacci; attente du retour du prix."
+        "side": side,
+        "entry": entry,
+        "stop_loss": stop,
+        "take_profit": target,
+        "rr": rr_value,
+        "risk_distance": risk,
+        "reward_distance": reward,
+        "buffer": buffer,
+    }, "Plan indicatif calculé à partir du prix observé et du swing Fibonacci."
 
 
 # ALERT STATE: no repeated alert every minute for the same active setup
@@ -1183,10 +906,10 @@ def load_alert_history():
 
 
 def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, trade_plan):
-    """Crée un ordre limite virtuel PENDING après confirmation."""
+    """Phase 1: alerte la configuration, mais n'ouvre aucun trade."""
     if setup.get("state") not in ("BULL_CONFIRMED", "BEAR_CONFIRMED"):
         return
-    if not trade_plan or not setup.get("fib"):
+    if not trade_plan or not setup.get("fib") or setup.get("trigger_level") is None:
         return
 
     fib = setup["fib"]
@@ -1197,60 +920,259 @@ def process_fibonacci_alert(pair, timeframe, setup, candle_time, current_price, 
     alert_state_key = f"fib_alerted_setup_{pair}_{timeframe}"
     if st.session_state.get(alert_state_key) == signal_key:
         return
+
     if not supabase_configured():
-        st.error("Trade virtuel non créé : vérifie SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY.")
+        st.error("Alerte non envoyée : Supabase est nécessaire pour conserver le retest en attente de façon fiable.")
         return
 
     try:
-        saved, message = create_virtual_trade(pair, timeframe, setup, candle_time, trade_plan, fib_mode)
+        saved, message = create_pending_setup(
+            pair, timeframe, setup, candle_time, trade_plan, fib_mode
+        )
     except Exception as exc:
-        st.error(f"Erreur Supabase — création du trade virtuel : {exc}")
+        st.error(f"Erreur Supabase — sauvegarde de la configuration : {exc}")
         return
+
     if not saved:
         st.info(f"Supabase : {message}")
         st.session_state[alert_state_key] = signal_key
         return
 
-    zone_low, zone_high = float(fib["zone_low"]), float(fib["zone_high"])
+    zone_low = float(fib["zone_low"])
+    zone_high = float(fib["zone_high"])
+    trigger = float(setup["trigger_level"])
     now_text = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
-    subject = f"{'🟢 ORDRE LIMITE ACHAT' if bullish else '🔴 ORDRE LIMITE VENTE'} Fibonacci — {pair} {timeframe}"
-    fmt = lambda value: f"{float(value):.5f}"
+    subject = f"{'🟡 Configuration ACHAT' if bullish else '🟡 Configuration VENTE'} Fibonacci — {pair} {timeframe}"
     body = (
-        f"ORDRE LIMITE VIRTUEL EN ATTENTE — signal Fibonacci confirmé sur {pair} en {timeframe}.\n"
+        f"Configuration Fibonacci détectée sur {pair} en {timeframe}.\n"
         f"Direction : {direction}.\n"
-        f"Zone Fibonacci 50–61,8 % : {fmt(zone_low)} à {fmt(zone_high)}.\n"
-        f"Entrée limite à surveiller : {fmt(trade_plan['entry'])}.\n"
-        f"Stop-loss : {fmt(trade_plan['stop_loss'])}.\n"
-        f"Take-profit : {fmt(trade_plan['take_profit'])}.\n"
-        f"Ratio R/R : 1:{float(trade_plan['rr']):.2f}.\n"
-        f"Prix observé au signal : {fmt(current_price)}.\n"
+        f"Zone Fibonacci 50–61,8 % : {zone_low:.5f} à {zone_high:.5f}.\n"
+        f"Niveau de cassure à retester : {trigger:.5f}.\n"
+        f"Prix observé lors du signal : {float(current_price):.5f}.\n"
         f"Dernière chandelle clôturée : {candle_time}.\n\n"
-        f"Ne pas entrer au prix actuel : attendre que le prix revienne à {fmt(trade_plan['entry'])}. "
-        "L'ordre reste en attente au maximum 4 chandelles M30 ou 6 chandelles M5. Aucun ordre OANDA n'est envoyé."
+        "ATTENTION : ce courriel est une alerte de configuration, PAS une autorisation d'entrée.\n"
+        "Attendre le retour au niveau de cassure, puis une nouvelle chandelle M5/M30 de confirmation.\n"
+        "Une deuxième alerte sera envoyée seulement si l'entrée reste valide. Aucun ordre automatique."
     )
-    append_alert_history({
-        "Heure alerte": now_text, "Heure chandelle": candle_time,
-        "Instrument": pair, "Timeframe": timeframe, "Direction": direction,
-        "Etat": "ORDRE LIMITE EN ATTENTE", "Zone basse": zone_low, "Zone haute": zone_high,
-        "Entree": trade_plan["entry"], "Stop-loss": trade_plan["stop_loss"],
-        "Take-profit": trade_plan["take_profit"], "R_R": trade_plan["rr"],
-        "Prix au signal": current_price, "Mode Fibonacci": fib_mode,
-        "Resultat": "", "Notes": "Ordre limite PENDING; entrée virtuelle seulement au retour du prix dans la zone.",
+    record = {
+        "Heure alerte": now_text,
+        "Heure chandelle": candle_time,
+        "Instrument": pair,
+        "Timeframe": timeframe,
+        "Direction": direction,
+        "Etat": "CONFIGURATION — ATTENTE RETEST",
+        "Zone basse": zone_low,
+        "Zone haute": zone_high,
+        "Entree": "",
+        "Stop-loss": "",
+        "Take-profit": "",
+        "R_R": "",
+        "Prix au signal": current_price,
+        "Mode Fibonacci": fib_mode,
+        "Resultat": "",
+        "Notes": f"Niveau à retester : {trigger:.5f}. Aucun trade ouvert.",
+    }
+    append_alert_history(record)
+    st.session_state.setdefault("fib_new_alerts", [])
+    st.session_state["fib_new_alerts"].append({
+        "Heure": now_text,
+        "Instrument": pair,
+        "Timeframe": timeframe,
+        "Signal": subject,
+        "Zone": f"{zone_low:.5f} – {zone_high:.5f}",
+        "Entrée": "En attente du retest",
+        "SL": "—",
+        "TP": "—",
+        "R/R": "—",
     })
-    st.session_state.setdefault("fib_new_alerts", []).append({
-        "Heure": now_text, "Instrument": pair, "Timeframe": timeframe, "Signal": subject,
-        "Zone": f"{zone_low:.5f} – {zone_high:.5f}", "Entrée": fmt(trade_plan["entry"]),
-        "SL": fmt(trade_plan["stop_loss"]), "TP": fmt(trade_plan["take_profit"]),
-        "R/R": f"1:{float(trade_plan['rr']):.2f}",
-    })
+
     if not mute_alerts:
         play_voice_alert(VOICE_STRONG_BULL if bullish else VOICE_STRONG_BEAR)
     if email_alerts_enabled:
         sent, status = send_email_alert(subject, body)
         if not sent:
             st.warning(status)
-    st.success(f"{pair} {timeframe} : ordre limite virtuel {direction} en attente du retour du prix.")
+    st.success("Configuration enregistrée : attente du retest avant toute entrée.")
     st.session_state[alert_state_key] = signal_key
+
+
+def process_pending_entries(pair, timeframe, closed_df, current_price):
+    """Phase 2: attend le retest puis une nouvelle clôture dans le sens du trade."""
+    if not supabase_configured() or closed_df.empty:
+        return
+
+    try:
+        pending_setups = load_pending_setups(pair, timeframe)
+    except Exception as exc:
+        st.warning(f"Erreur Supabase — lecture des configurations en attente : {exc}")
+        return
+
+    for pending in pending_setups:
+        try:
+            meta = json.loads(pending.get("notes") or "{}")
+            if meta.get("phase") != "WAIT_RETEST":
+                continue
+
+            direction = pending["direction"]
+            trigger = float(meta["trigger_level"])
+            atr = float(meta["atr"])
+            tolerance = float(meta.get("retest_tolerance_atr", 0.15)) * atr
+            max_extension = float(meta.get("max_entry_extension_atr", 0.25)) * atr
+            max_wait = int(meta.get("max_wait_candles", 6))
+            stop = float(pending["stop_loss"])
+            last_processed = pd.to_datetime(meta["last_processed_candle"], utc=True)
+
+            candles = closed_df.copy()
+            candles["_utc_time"] = pd.to_datetime(candles["time"], utc=True)
+            later = candles[candles["_utc_time"] > last_processed]
+            if later.empty:
+                continue
+
+            completed_trade = False
+            expired_note = None
+            for _, candle in later.iterrows():
+                high, low = float(candle["high"]), float(candle["low"])
+                open_price, close = float(candle["open"]), float(candle["close"])
+                candle_stamp = pd.Timestamp(candle["time"]).isoformat()
+                meta["last_processed_candle"] = candle_stamp
+                meta["bars_elapsed"] = int(meta.get("bars_elapsed", 0)) + 1
+                if meta["bars_elapsed"] > max_wait:
+                    expired_note = "Configuration expirée : délai maximal de retest et de confirmation dépassé."
+                    break
+
+                # Invalidation avant entrée : si le stop théorique est touché, on annule.
+                stop_touched = (low <= stop) if direction == "BULL" else (high >= stop)
+                if stop_touched:
+                    expired_note = "Configuration annulée : le stop théorique a été touché avant l'entrée confirmée."
+                    break
+
+                # Le retest doit revenir près du niveau de cassure.
+                if not meta.get("retest_seen"):
+                    retest_band_low = trigger - tolerance
+                    retest_band_high = trigger + tolerance
+                    overlaps_retest = low <= retest_band_high and high >= retest_band_low
+                    if overlaps_retest:
+                        meta["retest_seen"] = True
+                        meta["retest_high"] = high
+                        meta["retest_low"] = low
+                        meta["retest_time"] = candle_stamp
+                    if meta["bars_elapsed"] >= max_wait and not meta.get("retest_seen"):
+                        expired_note = "Configuration expirée : aucun retest du niveau de cassure dans le délai prévu."
+                        break
+                    # Confirmation obligatoire sur une chandelle ultérieure.
+                    continue
+
+                # La chandelle de confirmation doit être postérieure à celle du retest.
+                if direction == "BULL":
+                    confirmed = close > open_price and close > float(meta["retest_high"])
+                    extension = max(0.0, close - trigger)
+                else:
+                    confirmed = close < open_price and close < float(meta["retest_low"])
+                    extension = max(0.0, trigger - close)
+
+                if confirmed:
+                    if extension > max_extension:
+                        expired_note = (
+                            "Configuration annulée : la confirmation est arrivée trop loin du niveau de retest; "
+                            "aucune entrée tardive n'est autorisée."
+                        )
+                        break
+
+                    fib = {
+                        "direction": direction,
+                        "zone_low": float(meta["zone_low"]),
+                        "zone_high": float(meta["zone_high"]),
+                        "atr": atr,
+                        "endpoint": {"price": float(meta["endpoint_price"])},
+                        "origin": {"price": float(meta["origin_price"])},
+                        "manual": bool(meta.get("manual", False)),
+                    }
+                    setup = {"state": direction + "_CONFIRMED", "fib": fib}
+                    # Utilise la clôture de la chandelle de confirmation, pas un prix live potentiellement éloigné.
+                    final_plan, plan_message = build_trade_plan(setup, close)
+                    if not final_plan:
+                        expired_note = f"Configuration annulée après retest : {plan_message}"
+                        break
+
+                    activate_pending_setup(pending, candle, final_plan)
+                    now_text = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
+                    direction_label = "ACHAT" if direction == "BULL" else "VENTE"
+                    subject = f"{'🟢 ENTRÉE ACHAT' if direction == 'BULL' else '🔴 ENTRÉE VENTE'} confirmée après retest — {pair} {timeframe}"
+                    body = (
+                        f"ENTRÉE POTENTIELLE CONFIRMÉE après retest sur {pair} en {timeframe}.\n"
+                        f"Direction : {direction_label}.\n"
+                        f"Entrée indicative (clôture de confirmation) : {final_plan['entry']:.5f}.\n"
+                        f"Stop-loss : {final_plan['stop_loss']:.5f}.\n"
+                        f"Take-profit : {final_plan['take_profit']:.5f}.\n"
+                        f"Ratio R/R : 1:{final_plan['rr']:.2f}.\n"
+                        f"Niveau retesté : {trigger:.5f}.\n"
+                        f"Chandelle de confirmation : {candle_stamp}.\n\n"
+                        "Le retest et la reprise ont été confirmés sur le même timeframe que le signal initial. "
+                        "Valider le prix disponible avant toute exécution. Aucun ordre automatique n'est envoyé."
+                    )
+                    record = {
+                        "Heure alerte": now_text,
+                        "Heure chandelle": candle_stamp,
+                        "Instrument": pair,
+                        "Timeframe": timeframe,
+                        "Direction": direction_label,
+                        "Etat": "ENTREE CONFIRMEE APRES RETEST",
+                        "Zone basse": meta["zone_low"],
+                        "Zone haute": meta["zone_high"],
+                        "Entree": final_plan["entry"],
+                        "Stop-loss": final_plan["stop_loss"],
+                        "Take-profit": final_plan["take_profit"],
+                        "R_R": final_plan["rr"],
+                        "Prix au signal": close,
+                        "Mode Fibonacci": meta.get("fib_mode", "AUTOMATIQUE"),
+                        "Resultat": "",
+                        "Notes": "Retest puis confirmation sur chandelle clôturée; trade virtuel activé.",
+                    }
+                    append_alert_history(record)
+                    st.session_state.setdefault("fib_new_alerts", [])
+                    st.session_state["fib_new_alerts"].append({
+                        "Heure": now_text,
+                        "Instrument": pair,
+                        "Timeframe": timeframe,
+                        "Signal": subject,
+                        "Zone": f"{float(meta['zone_low']):.5f} – {float(meta['zone_high']):.5f}",
+                        "Entrée": f"{final_plan['entry']:.5f}",
+                        "SL": f"{final_plan['stop_loss']:.5f}",
+                        "TP": f"{final_plan['take_profit']:.5f}",
+                        "R/R": f"1:{final_plan['rr']:.2f}",
+                    })
+                    if not mute_alerts:
+                        play_voice_alert(VOICE_STRONG_BULL if direction == "BULL" else VOICE_STRONG_BEAR)
+                    if email_alerts_enabled:
+                        sent, status = send_email_alert(subject, body)
+                        if not sent:
+                            st.warning(status)
+                    st.success(f"{pair} {timeframe} : entrée confirmée après retest. Trade virtuel activé.")
+                    completed_trade = True
+                    break
+
+                if meta["bars_elapsed"] >= max_wait:
+                    expired_note = "Configuration expirée : retest observé, mais aucune reprise confirmée dans le délai prévu."
+                    break
+
+            if completed_trade:
+                continue
+            if expired_note:
+                update_pending_setup(pending["id"], meta, status="EXPIRED", note=expired_note)
+                st.info(f"{pair} {timeframe} : {expired_note}")
+            else:
+                update_pending_setup(pending["id"], meta)
+                if meta.get("retest_seen"):
+                    st.info(
+                        f"{pair} {timeframe} : retest détecté à {trigger:.5f}; "
+                        "attente d'une nouvelle chandelle clôturée de confirmation."
+                    )
+                else:
+                    st.info(
+                        f"{pair} {timeframe} : configuration en attente du retest de {trigger:.5f}."
+                    )
+        except Exception as exc:
+            st.warning(f"Erreur de suivi du retest {pair} {timeframe} : {exc}")
 
 
 # MAIN DASHBOARD — en-tête visuel uniquement
@@ -1270,41 +1192,28 @@ st.markdown(
       <div style="text-align:right;min-width:170px;">
         <div style="display:inline-block;padding:7px 13px;border-radius:30px;
           border:1px solid rgba(32,214,138,.45);background:rgba(32,214,138,.10);
-          color:#45e6a0;font-weight:700;font-size:13px;">● SIGNAUX CONFIRMÉS UNIQUEMENT</div>
+          color:#45e6a0;font-weight:700;font-size:13px;">● MODE SURVEILLANCE</div>
         <div style="color:#9bb9d8;font-size:12px;margin-top:7px;">{now_ny.strftime('%d %B %Y — %H:%M:%S')} NY&nbsp; • &nbsp;Actualisation 60 s</div>
       </div>
     </div>
     """, unsafe_allow_html=True
 )
-st.markdown("""
-<style>
-/* Contraste renforcé pour les libellés, options et chiffres */
-[data-testid="stMetricLabel"] p { color: #c8d7e8 !important; font-weight: 700 !important; }
-[data-testid="stMetricValue"] { color: #ffffff !important; font-weight: 750 !important; }
-[data-testid="stRadio"] label, [data-testid="stRadio"] p { color: #edf4fb !important; }
-[data-testid="stRadio"] [role="radiogroup"] label { color: #edf4fb !important; }
-</style>
-""", unsafe_allow_html=True)
-
 summary = st.columns(4)
-selected_pairs = list(dict.fromkeys(config["pair"] for config in instruments_config))
-summary[0].metric(
-    "INSTRUMENTS SUIVIS", str(len(selected_pairs)),
-    " • ".join(pair_labels.get(pair, pair) for pair in selected_pairs)
-)
-summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Signaux indépendants")
+summary[0].metric("INSTRUMENTS SUIVIS", "2", "SPX500 • XAU/USD")
+summary[1].metric("UNITÉS DE TEMPS", "M30 / M5", "Analyse + exécution")
 summary[2].metric("DONNÉES", "OANDA", "Actualisation automatique")
 summary[3].metric("MODE", "Surveillance", "Aucun ordre automatique")
 st.caption(
-    "Alertes uniquement lorsqu’un rebond Fibonacci est confirmé et qu’un plan de trade valide est disponible. "
-    "Le M30 et le M5 génèrent leurs propres signaux; le M5 est bloqué seulement si le biais M30 est opposé. "
-    "Chaque signal confirmé crée un ordre limite virtuel; le trade ne s'ouvre qu'au retour du prix à l'entrée. Aucun ordre réel n’est envoyé."
+    "Alertes basées sur le dernier swing confirmé, le retracement Fibonacci "
+    "50–61,8 %, un rejet puis la cassure de son extrême, avec filtre anti-entrée tardive. "
+    "Une deuxième confirmation après retest est exigée avant toute entrée."
 )
 
 for config in instruments_config:
     pair = config["pair"]
     timeframe = config["timeframe"]
     st.markdown("---")
+    st.markdown(f"### <span style=\"color:#22b8ff;\">●</span> {pair.replace('_USD', '')} <span style=\"color:#8eabc9;font-size:15px;\">— {timeframe}</span>", unsafe_allow_html=True)
 
     try:
         raw_df = get_data(pair, timeframe)
@@ -1325,34 +1234,16 @@ for config in instruments_config:
                 st.warning(f"Erreur Supabase — suivi des trades virtuels ({pair}) : {exc}")
 
         df = add_indicators(closed_df)
-        m30_context = get_m30_market_context(pair) if timeframe in ("M5", "M30") else None
         # Utilise la dernière chandelle reçue (potentiellement en formation) comme prix courant.
         # Cela évite une requête M1 OANDA supplémentaire pour chaque instrument.
         current_price = float(raw_df.iloc[-1]["close"])
         last = df.iloc[-1]
 
-        # Carte de contrôle regroupant instrument, prix et méthode Fibonacci.
-        with st.container(border=True):
-            st.markdown(
-                f"""<div style="background:#14243a;padding:12px 16px;border-radius:10px;
-                border-left:5px solid #35b6e8;margin-bottom:12px;">
-                <div style="color:#f4f7fb;font-size:20px;font-weight:700;">
-                {pair_labels.get(pair, pair)} <span style="color:#9fc5df;font-size:15px;">— {timeframe}</span>
-                </div><div style="color:#c6d5e4;font-size:12px;margin-top:3px;">ANALYSE DU MARCHÉ</div>
-                </div>""",
-                unsafe_allow_html=True
-            )
-            price_col, mode_col = st.columns([1, 2])
-            with price_col:
-                price_decimals = 2 if ("BTC" in pair.upper() or "XAU" in pair.upper() or "SPX" in pair.upper()) else 5
-                formatted_price = f"{current_price:,.{price_decimals}f}"
-                st.metric(label="PRIX ACTUEL · OANDA", value=formatted_price)
-            with mode_col:
-                fib_mode = st.radio(
-                    "MÉTHODE FIBONACCI", ["Automatique", "Manuel"],
-                    horizontal=True, key=f"fib_mode_{pair}_{timeframe}",
-                    help="En mode manuel, choisis les chandelles du sommet et du creux, puis ajuste leurs prix."
-                )
+        fib_mode = st.radio(
+            "Méthode Fibonacci", ["Automatique", "Manuel"],
+            horizontal=True, key=f"fib_mode_{pair}_{timeframe}",
+            help="En mode manuel, choisis les chandelles du sommet et du creux, puis ajuste leurs prix."
+        )
         fib_override = None
         if fib_mode == "Manuel":
             st.caption(
@@ -1415,45 +1306,19 @@ for config in instruments_config:
                 "fib": None
             }
         else:
-            setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override, timeframe=timeframe)
-
-        if setup.get("state") in ("BULL_CONFIRMED", "BEAR_CONFIRMED") and m30_context:
-            required_bias = "BULL" if setup["state"] == "BULL_CONFIRMED" else "BEAR"
-            context_bias = m30_context.get("bias", "NEUTRAL")
-            # M30 : filtre strict, tendance EMA/DI ET structure doivent confirmer.
-            # M5 : on conserve le comportement antérieur et on bloque seulement
-            # lorsqu'un biais M30 clairement opposé est établi.
-            should_block = (
-                (timeframe == "M30" and context_bias != required_bias)
-                or (timeframe == "M5" and context_bias in ("BULL", "BEAR")
-                    and context_bias != required_bias)
-            )
-            if should_block:
-                if timeframe == "M30":
-                    filter_label = "⚪ SIGNAL M30 BLOQUÉ — TENDANCE / STRUCTURE NON ALIGNÉES"
-                    filter_state = "M30_FILTERED"
-                    filter_reason = "Filtre M30 strict : le signal Fibonacci doit être dans le même sens que la tendance ET la structure. "
-                else:
-                    filter_label = "⚪ CONFIGURATION M5 BLOQUÉE — CONTEXTE M30 OPPOSÉ"
-                    filter_state = "M30_FILTERED"
-                    filter_reason = "Filtre M30 : la configuration M5 est opposée au biais directeur. "
-                setup = {
-                    **setup,
-                    "state": filter_state,
-                    "label": filter_label,
-                    "color": "gray",
-                    "details": (setup.get("details", "") + " " + filter_reason
-                                + m30_context.get("details", "Contexte M30 indisponible.")
-                                + " Aucun trade virtuel n'est créé.")
-                }
-
+            setup = evaluate_fibonacci_setup(df, current_price, fib_override=fib_override)
         candle_time = last["time"].strftime("%Y-%m-%d %H:%M NY")
+
         trade_plan, trade_message = build_trade_plan(setup, current_price)
 
 
         process_fibonacci_alert(
             pair, timeframe, setup, candle_time, current_price, trade_plan
         )
+        process_pending_entries(pair, timeframe, closed_df, current_price)
+
+        if current_price is not None:
+            st.write(f"💵 Prix actuel OANDA : **{current_price:.5f}**")
 
         st.markdown(
             f"<h4 style='color:{setup['color']};'>{setup['label']}</h4>",
@@ -1462,23 +1327,9 @@ for config in instruments_config:
         st.write(setup["details"])
         st.caption(f"Signal calculé sur la dernière chandelle clôturée : {candle_time}")
 
-        if timeframe in ("M5", "M30") and m30_context:
-            context_label = {"BULL": "HAUSSIER", "BEAR": "BAISSIER", "NEUTRAL": "NEUTRE"}.get(m30_context["bias"], "N/D")
-            structure_label = {"BULL": "HAUSSIÈRE", "BEAR": "BAISSIÈRE", "NEUTRAL": "INDÉCISE"}.get(m30_context.get("structure_bias", "NEUTRAL"), "N/D")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("BIAIS M30 VALIDÉ", context_label)
-            col2.metric("STRUCTURE M30", structure_label)
-            col3.metric("FORCE M30", m30_context.get("strength", "N/D"))
-            col4.metric("ADX M30", "N/D" if m30_context.get("adx") is None else f"{m30_context['adx']:.1f}")
-            st.caption(m30_context.get("details", ""))
-            if timeframe == "M30":
-                st.caption("Filtre M30 strict : un trade n'est permis que si les EMA/DI et les sommets/creux confirment la même direction.")
-            else:
-                st.caption("Filtre M5 : seul un biais M30 clairement opposé bloque le signal; un biais neutre reste autorisé.")
-        else:
-            col1, col2 = st.columns(2)
-            col1.metric("ADX14", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
-            col2.metric("Fibonacci", "Valide" if setup.get("fib") else "En attente")
+        col1, col2 = st.columns(2)
+        col1.metric("ADX14", "N/D" if pd.isna(last["ADX14"]) else f"{last['ADX14']:.1f}")
+        col2.metric("Fibonacci", "Valide" if setup.get("fib") else "En attente")
         if setup.get("fib"):
             fib = setup["fib"]
             zone_name = setup.get("zone_name", "ZONE DE RETRACEMENT")
@@ -1487,18 +1338,17 @@ for config in instruments_config:
 
         st.markdown("#### Plan de trade Fibonacci")
         if trade_plan:
-            st.info(
-                f"ORDRE LIMITE INDICATIF {trade_plan['side']} — "
-                f"R/R 1:{trade_plan['rr']:.2f} — ATTENDRE LE RETOUR DU PRIX"
+            st.success(
+                f"PLAN INDICATIF {trade_plan['side']} — "
+                f"R/R 1:{trade_plan['rr']:.2f}"
             )
             plan_c1, plan_c2, plan_c3 = st.columns(3)
-            plan_c1.metric("Entrée limite (milieu de zone)", f"{trade_plan['entry']:.5f}")
+            plan_c1.metric("Entrée indicative", f"{trade_plan['entry']:.5f}")
             plan_c2.metric("Stop-loss", f"{trade_plan['stop_loss']:.5f}")
             plan_c3.metric("Take-profit", f"{trade_plan['take_profit']:.5f}")
             st.caption(
-                f"Entrée au milieu de la zone Fibonacci : ne pas entrer au marché. "
-                f"Le trade virtuel s'ouvre seulement si le prix revient à l'entrée limite. "
-                f"SL au-delà de la zone avec une marge de 0,20 ATR; TP à l'extrémité du swing. Risque : "
+                f"SL placé au-delà de la zone avec une marge de 0,20 ATR. "
+                f"TP placé à l'extrémité du swing. Risque : "
                 f"{trade_plan['risk_distance']:.5f} | Récompense : "
                 f"{trade_plan['reward_distance']:.5f}. "
                 "À valider manuellement; aucun ordre n'est envoyé."
@@ -1533,7 +1383,7 @@ for config in instruments_config:
                 y=close_y,
                 name="Close",
                 line=dict(color="#B8C7D9", dash="dot", width=2),
-                hoverinfo="none"
+                hovertemplate="Close : %{y:.5f}<extra></extra>"
             ),
             row=1, col=1
         )
@@ -1546,7 +1396,7 @@ for config in instruments_config:
             ]:
                 fig.add_trace(
                     go.Scatter(x=df["time"], y=df[ema_name], name=ema_name,
-                               line=dict(color=ema_color, dash=ema_dash, width=2), hoverinfo="none"), row=1, col=1
+                               line=dict(color=ema_color, dash=ema_dash, width=2)), row=1, col=1
                 )
         if setup.get("fib"):
             fib = setup["fib"]
@@ -1567,7 +1417,7 @@ for config in instruments_config:
                     x=[x0, x1], y=[level, level], mode="lines",
                     name=level_name,
                     line=dict(color=fib_color, width=fib_width, dash=fib_dash),
-                    hoverinfo="none"
+                    hovertemplate=f"{level_name}<br>%{{y:.5f}}<extra></extra>"
                 ), row=1, col=1)
             if fib.get("manual"):
                 fig.add_trace(go.Scatter(
@@ -1578,13 +1428,13 @@ for config in instruments_config:
                     textposition="top center",
                     marker=dict(size=11, color="white", line=dict(color="black", width=2)),
                     name="Ancrages manuels",
-                    hoverinfo="none"
+                    hovertemplate="Ancrage<br>%{y:.5f}<extra></extra>"
                 ), row=1, col=1)
 
         fig.add_trace(
             go.Bar(
                 x=df["time"], y=df["volume"], name="Volume",
-                marker_color="rgba(53,182,255,0.48)", hoverinfo="none"
+                marker_color="rgba(53,182,255,0.48)"
             ), row=2, col=1
         )
         # Palette graphique harmonisée avec le thème bleu nuit du Dashboard.
@@ -1600,7 +1450,7 @@ for config in instruments_config:
                 bgcolor="rgba(7,20,38,0.72)",
                 font=dict(color="#DCE8F5", size=11)
             ),
-            hovermode="x",
+            hovermode="x unified",
             hoverlabel=dict(
                 bgcolor="#102A45", bordercolor="#247DB5",
                 font=dict(color="#F4F8FC")
@@ -1618,228 +1468,10 @@ for config in instruments_config:
             tickfont=dict(color="#AFC2D8"),
             title_font=dict(color="#AFC2D8")
         )
-        # Panneau fixe de lecture : les valeurs suivent la chandelle survolée,
-        # sans afficher l'info-bulle Plotly flottante au milieu du graphique.
-        chart_id = "chart_" + hashlib.md5(f"{pair}_{timeframe}".encode("utf-8")).hexdigest()[:10]
-        chart_html = fig.to_html(
-            full_html=False,
-            include_plotlyjs="cdn",
-            config={"responsive": True, "displaylogo": False},
-            div_id=chart_id
-        )
-        price_decimals = 2 if any(token in pair.upper() for token in ("BTC", "XAU", "SPX")) else 5
-        panel_script = f"""
-        <style>
-          html, body {{ margin:0; padding:0; background:#071426; overflow:hidden; }}
-          .chart-wrap {{ position:relative; width:100%; }}
-          .hover-readout {{ position:absolute; z-index:20; top:66px; left:88px;
-            min-width:205px; max-width:260px; padding:10px 12px;
-            border:1px solid #2873a8; border-radius:9px;
-            background:rgba(7,20,38,.94); color:#edf6ff;
-            box-shadow:0 5px 18px rgba(0,0,0,.28);
-            font:12px Inter,Arial,sans-serif; pointer-events:none; }}
-          .hover-readout .heading {{ color:#70caff; font-weight:700; margin-bottom:6px; }}
-          .hover-readout .row {{ display:flex; justify-content:space-between; gap:16px;
-            padding:2px 0; white-space:nowrap; }}
-          .hover-readout .muted {{ color:#9db8d4; }}
-        </style>
-        <div class="chart-wrap">
-          <div class="hover-readout" id="readout_{chart_id}">
-            <div class="heading">LECTURE DE LA CHANDELLE</div>
-            <div class="muted">Survole une chandelle pour afficher ses valeurs ici.</div>
-          </div>
-          {chart_html}
-        </div>
-        <script>
-        (function() {{
-          const chart = document.getElementById("{chart_id}");
-          const panel = document.getElementById("readout_{chart_id}");
-          if (!chart || !panel || !chart.on) return;
-          const decimals = {price_decimals};
-          const order = ["Close", "EMA50", "EMA100", "EMA200"];
-          const colors = {{"Close":"#B8C7D9", "EMA50":"#35B6FF", "EMA100":"#B8C7D9", "EMA200":"#FFB454"}};
-          chart.on("plotly_hover", function(ev) {{
-            if (!ev || !ev.points || !ev.points.length) return;
-            const values = {{}};
-            let x = ev.points[0].x;
-            ev.points.forEach(function(pt) {{
-              const name = (pt.data && pt.data.name) || "";
-              if (order.includes(name) && Number.isFinite(Number(pt.y))) values[name] = Number(pt.y);
-            }});
-            const date = new Date(x);
-            const dateText = Number.isNaN(date.getTime()) ? String(x) :
-              new Intl.DateTimeFormat("fr-CA", {{timeZone:"America/New_York", dateStyle:"medium", timeStyle:"short"}}).format(date) + " NY";
-            let html = '<div class="heading">' + dateText + '</div>';
-            order.forEach(function(name) {{
-              if (values[name] !== undefined) {{
-                html += '<div class="row"><span style="color:' + colors[name] + '">' + name + '</span><strong>' +
-                  values[name].toLocaleString("en-US", {{minimumFractionDigits:decimals, maximumFractionDigits:decimals}}) + '</strong></div>';
-              }}
-            }});
-            if (Object.keys(values).length) panel.innerHTML = html;
-          }});
-        }})();
-        </script>
-        """
-        components.html(panel_script, height=740, scrolling=False)
+        st.plotly_chart(fig, width="stretch")
 
     except Exception as exc:
         st.error(f"Erreur pour {pair} ({timeframe}) : {exc}")
-
-
-# BILAN DU COMPTE OANDA — DONNÉES RÉELLES (PRACTICE)
-st.markdown("---")
-st.subheader("💰 Résultats réels — Compte OANDA Practice")
-st.caption(
-    "Données lues directement dans OANDA, indépendamment des trades virtuels Supabase. "
-    "Actualisation automatique selon le rafraîchissement du dashboard."
-)
-
-try:
-    oanda_data = load_oanda_real_performance(days=90)
-    oanda_currency = oanda_data["currency"]
-    oanda_fills = oanda_data["fills"]
-    oanda_open = oanda_data["open_trades"]
-    oanda_summary = oanda_data["summary"]
-    oanda_now = pd.Timestamp.now(tz="America/Toronto")
-    currency_label = oanda_currency
-    st.caption(f"Compte vérifié auprès d’OANDA : Good one — {oanda_data['account_id']} · Environnement Practice")
-
-    if oanda_fills.empty:
-        oanda_today = pd.DataFrame()
-        oanda_yesterday = pd.DataFrame()
-    else:
-        oanda_today = oanda_fills.loc[
-            oanda_fills["time_quebec"].dt.date == oanda_now.date()
-        ].copy()
-        yesterday_date = (oanda_now - pd.Timedelta(days=1)).date()
-        oanda_yesterday = oanda_fills.loc[
-            oanda_fills["time_quebec"].dt.date == yesterday_date
-        ].copy()
-
-    today_realized = float(oanda_today["net"].sum()) if not oanda_today.empty else 0.0
-    yesterday_realized = (
-        float(oanda_yesterday["net"].sum()) if not oanda_yesterday.empty else 0.0
-    )
-    open_unrealized = (
-        float(oanda_open["P/L latent"].sum()) if not oanda_open.empty else 0.0
-    )
-
-    # Valeurs du compte affichées séparément du P/L journalier.
-    balance = float(oanda_summary.get("balance", 0) or 0)
-    nav = float(oanda_summary.get("NAV", balance) or balance)
-    margin_available = float(oanda_summary.get("marginAvailable", 0) or 0)
-
-    oanda_cols = st.columns(5)
-    oanda_cols[0].metric(
-        "P/L réalisé aujourd'hui", f"{today_realized:+,.2f} {currency_label}"
-    )
-    oanda_cols[1].metric(
-        "P/L réalisé hier", f"{yesterday_realized:+,.2f} {currency_label}"
-    )
-    oanda_cols[2].metric(
-        "P/L latent (positions ouvertes)", f"{open_unrealized:+,.2f} {currency_label}"
-    )
-    oanda_cols[3].metric("Solde du compte", f"{balance:,.2f} {currency_label}")
-    oanda_cols[4].metric("Valeur nette (NAV)", f"{nav:,.2f} {currency_label}")
-
-    st.caption(
-        f"Marge disponible : {margin_available:,.2f} {currency_label} · "
-        f"{len(oanda_open)} position(s) ouverte(s) · "
-        f"{oanda_data['transactions_count']} transaction(s) récupérée(s) / "
-        f"{oanda_data['transaction_api_count']} annoncée(s) par OANDA · "
-        f"{oanda_data['transaction_pages']} page(s) · Historique : 90 jours · Québec"
-    )
-    for page_error in oanda_data.get("transaction_page_errors", []):
-        st.warning(page_error)
-
-    if not oanda_fills.empty:
-        st.markdown("#### 📆 Historique quotidien OANDA")
-        oanda_daily = (
-            oanda_fills.groupby("date_quebec", as_index=False)
-            .agg(
-                Transactions=("transaction_id", "count"),
-                **{
-                    "P/L brut": ("pl", "sum"),
-                    "Financement": ("financing", "sum"),
-                    "Commissions": ("commission", "sum"),
-                    "P/L net": ("net", "sum"),
-                },
-            )
-            .sort_values("date_quebec", ascending=False)
-        )
-        oanda_daily["Date"] = pd.to_datetime(
-            oanda_daily["date_quebec"], errors="coerce"
-        ).dt.strftime("%d/%m/%Y")
-        st.dataframe(
-            oanda_daily[
-                ["Date", "Transactions", "P/L brut", "Financement",
-                 "Commissions", "P/L net"]
-            ],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "P/L brut": st.column_config.NumberColumn(format="%+.2f"),
-                "Financement": st.column_config.NumberColumn(format="%+.2f"),
-                "Commissions": st.column_config.NumberColumn(format="%+.2f"),
-                "P/L net": st.column_config.NumberColumn(
-                    "P/L net", format="%+.2f"
-                ),
-            },
-        )
-
-        st.markdown("#### 🧾 Détail des transactions exécutées")
-        detail = oanda_fills.sort_values("time_quebec", ascending=False).copy()
-        detail["Heure (Québec)"] = detail["time_quebec"].dt.strftime(
-            "%d/%m/%Y %H:%M:%S"
-        )
-        detail = detail.rename(columns={
-            "instrument": "Instrument",
-            "pl": "P/L brut",
-            "financing": "Financement",
-            "commission": "Commission",
-            "net": "Net",
-        })
-        st.dataframe(
-            detail[["Heure (Québec)", "Instrument", "P/L brut",
-                    "Financement", "Commission", "Net"]],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "P/L brut": st.column_config.NumberColumn(format="%+.2f"),
-                "Financement": st.column_config.NumberColumn(format="%+.2f"),
-                "Commission": st.column_config.NumberColumn(format="%+.2f"),
-                "Net": st.column_config.NumberColumn(format="%+.2f"),
-            },
-        )
-    else:
-        st.info(
-            "Aucune transaction exécutée trouvée dans les 90 derniers jours. "
-            "Les positions ouvertes apparaissent séparément ci-dessous."
-        )
-
-    st.markdown("#### 📍 Positions actuellement ouvertes chez OANDA")
-    if oanda_open.empty:
-        st.info("Aucune position ouverte.")
-    else:
-        st.dataframe(
-            oanda_open,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "P/L latent": st.column_config.NumberColumn(
-                    f"P/L latent ({currency_label})", format="%+.2f"
-                ),
-                "Prix d'entrée": st.column_config.NumberColumn(format="%.5f"),
-                "Unités": st.column_config.NumberColumn(format="%.2f"),
-            },
-        )
-
-except Exception as oanda_exc:
-    st.error(
-        "Impossible de lire le bilan réel OANDA pour le moment. "
-        f"Vérifie la connexion Practice et les permissions API. Détail : {oanda_exc}"
-    )
 
 
 # SUIVI DES TRADES VIRTUELS SUPABASE
@@ -1896,218 +1528,21 @@ else:
             stat_cols[4].metric("Taux de réussite", f"{win_rate:.1f}%" if completed else "N/D")
             stat_cols[5].metric("Ambigus / expirés", f"{ambiguous} / {expired}")
 
-            # Semaine de trading : dimanche 17:00 au vendredi 17:00,
-            # selon l'heure de Québec (America/Toronto).
-            closed_df["_close_local"] = pd.to_datetime(
-                closed_df["close_time"], errors="coerce", utc=True
-            ).dt.tz_convert("America/Toronto")
-            now_local = pd.Timestamp.now(tz="America/Toronto")
-
-            # Repère le dimanche 17:00 le plus récent.
-            days_since_sunday = (now_local.weekday() + 1) % 7
-            week_start = (
-                now_local.normalize()
-                - pd.Timedelta(days=days_since_sunday)
-                + pd.Timedelta(hours=17)
-            )
-            if now_local < week_start:
-                week_start -= pd.Timedelta(days=7)
-
-            # La séance hebdomadaire se termine le vendredi à 17:00.
-            week_end = week_start + pd.Timedelta(days=5)
-            week_df = closed_df.loc[
-                (closed_df["_close_local"] >= week_start)
-                & (closed_df["_close_local"] < week_end)
-            ].copy()
-
-            week_trades = len(week_df)
-            week_wins = int((week_df["status"] == "WIN").sum())
-            week_losses = int((week_df["status"] == "LOSS").sum())
-            week_completed = week_wins + week_losses
-            week_win_rate = (week_wins / week_completed * 100) if week_completed else 0.0
-            week_net_usd = float(week_df["pnl_usd"].sum()) if week_trades else 0.0
-            week_net_r = float(week_df["result_r"].sum()) if week_trades else 0.0
-            week_gross_profit = float(week_df.loc[week_df["pnl_usd"] > 0, "pnl_usd"].sum())
-            week_gross_loss = abs(float(week_df.loc[week_df["pnl_usd"] < 0, "pnl_usd"].sum()))
-            week_pf = (
-                week_gross_profit / week_gross_loss if week_gross_loss > 0
-                else (float("inf") if week_gross_profit > 0 else 0.0)
-            )
-
-            # PERFORMANCE JOURNALIERE — journée civile au fuseau du Québec.
-            # Seuls les trades WIN/LOSS clôturés sont comptabilisés.
-            today_local_date = now_local.date()
-            today_df = closed_df.loc[
-                closed_df["_close_local"].notna()
-                & (closed_df["_close_local"].dt.date == today_local_date)
-            ].copy()
-
-            today_trades = len(today_df)
-            today_wins = int((today_df["status"] == "WIN").sum())
-            today_losses = int((today_df["status"] == "LOSS").sum())
-            today_completed = today_wins + today_losses
-            today_win_rate = (
-                today_wins / today_completed * 100 if today_completed else 0.0
-            )
-            today_net_usd = (
-                float(today_df["pnl_usd"].sum()) if today_trades else 0.0
-            )
-            today_net_r = (
-                float(today_df["result_r"].sum()) if today_trades else 0.0
-            )
-
-            st.markdown("#### 📅 Performance de la journée")
+            st.markdown("#### 💵 Rentabilité simulée")
             st.caption(
-                f"Résultats des trades clôturés aujourd'hui ({now_local.strftime('%d %B %Y')}, "
-                "heure du Québec). Les trades encore ouverts ou en attente sont exclus."
-            )
-            daily_cols = st.columns(4)
-            daily_cols[0].metric(
-                "Profit / perte du jour",
-                f"{today_net_usd:+,.2f} $",
-                delta=f"{today_net_r:+.2f} R",
-                delta_color="normal",
-            )
-            daily_cols[1].metric("Trades clôturés", today_trades)
-            daily_cols[2].metric(
-                "Gagnants / perdants", f"{today_wins} / {today_losses}"
-            )
-            daily_cols[3].metric(
-                "Taux de réussite",
-                f"{today_win_rate:.1f}%" if today_completed else "N/D",
-            )
-
-            # Historique quotidien permanent : reconstruit depuis Supabase à chaque actualisation.
-            if not closed_df.empty:
-                daily_history = closed_df.loc[
-                    closed_df["_close_local"].notna()
-                ].copy()
-                daily_history["_jour"] = daily_history["_close_local"].dt.strftime("%Y-%m-%d")
-                daily_history = (
-                    daily_history.groupby("_jour", as_index=False)
-                    .agg(
-                        Trades=("status", "count"),
-                        Gagnants=("status", lambda values: int((values == "WIN").sum())),
-                        Perdants=("status", lambda values: int((values == "LOSS").sum())),
-                        **{
-                            "Résultat ($)": ("pnl_usd", "sum"),
-                            "Résultat (R)": ("result_r", "sum"),
-                        },
-                    )
-                )
-                daily_history["Taux réussite"] = (
-                    daily_history["Gagnants"]
-                    / (daily_history["Gagnants"] + daily_history["Perdants"]).replace(0, pd.NA)
-                    * 100
-                )
-                daily_history = daily_history.sort_values("_jour", ascending=False)
-                daily_history = daily_history.rename(columns={"_jour": "Date"})
-                daily_history["Date"] = pd.to_datetime(
-                    daily_history["Date"], errors="coerce"
-                ).dt.strftime("%d/%m/%Y")
-                st.markdown("##### Historique des journées")
-                st.dataframe(
-                    daily_history[
-                        ["Date", "Trades", "Gagnants", "Perdants",
-                         "Taux réussite", "Résultat ($)", "Résultat (R)"]
-                    ],
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "Taux réussite": st.column_config.NumberColumn(
-                            "Taux réussite", format="%.1f %%"
-                        ),
-                        "Résultat ($)": st.column_config.NumberColumn(
-                            "Profit / perte", format="%+.2f $"
-                        ),
-                        "Résultat (R)": st.column_config.NumberColumn(
-                            "Résultat", format="%+.2f R"
-                        ),
-                    },
-                )
-            else:
-                st.info("L'historique quotidien apparaîtra après la clôture du premier trade.")
-
-            st.markdown("#### 💹 Tableau de performance")
-            st.caption(
-                f"Résultats réalisés uniquement · Risque simulé de {risk_per_trade:.2f} $ par trade "
+                f"Calcul basé sur un risque fixe de {risk_per_trade:.2f} $ par trade "
                 f"({risk_percent:.2f} % du capital configuré de {capital:.2f} $). "
-                "Les trades en attente, ouverts, ambigus et expirés ne sont pas inclus dans le profit net."
+                "Les configurations en attente, trades ouverts, ambigus et expirés sont exclues du résultat réalisé."
             )
-
-            def performance_panel(title, subtitle, net_usd, net_r, winrate, trade_count,
-                                  wins_count, losses_count, factor, accent):
-                net_color = "#36d399" if net_usd >= 0 else "#ff6b7a"
-                factor_text = f"{factor:.2f}" if factor != float("inf") else "∞"
-                return f"""
-                <div style="
-                    background:linear-gradient(145deg, #17263b 0%, #101b2b 100%);
-                    border:1px solid rgba(148,163,184,.20);
-                    border-top:3px solid {accent};
-                    border-radius:16px;padding:19px 20px 17px;
-                    box-shadow:0 8px 24px rgba(0,0,0,.16);min-height:210px;">
-                  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
-                    <div>
-                      <div style="font-size:17px;font-weight:750;color:#f3f6fb;">{title}</div>
-                      <div style="font-size:11px;color:#9eafc5;margin-top:3px;">{subtitle}</div>
-                    </div>
-                    <div style="font-size:10px;letter-spacing:1px;text-transform:uppercase;
-                                color:{accent};border:1px solid {accent}55;border-radius:20px;
-                                padding:5px 9px;font-weight:700;">{trade_count} trades</div>
-                  </div>
-                  <div style="margin-top:20px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">
-                    <span style="font-size:32px;line-height:1.1;font-weight:800;color:{net_color};">
-                      {net_usd:+,.2f} $
-                    </span>
-                    <span style="font-size:14px;font-weight:700;color:{net_color};">{net_r:+.2f} R</span>
-                  </div>
-                  <div style="height:1px;background:rgba(148,163,184,.17);margin:17px 0 13px;"></div>
-                  <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">
-                    <div>
-                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Réussite</div>
-                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">{winrate:.1f}%</div>
-                    </div>
-                    <div>
-                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Gagnants / pertes</div>
-                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">
-                        <span style="color:#36d399;">{wins_count}</span>
-                        <span style="color:#718096;"> / </span>
-                        <span style="color:#ff6b7a;">{losses_count}</span>
-                      </div>
-                    </div>
-                    <div>
-                      <div style="font-size:10px;color:#93a4ba;text-transform:uppercase;letter-spacing:.5px;">Profit factor</div>
-                      <div style="font-size:19px;font-weight:750;color:#f3f6fb;margin-top:4px;">{factor_text}</div>
-                    </div>
-                  </div>
-                </div>
-                """
-
-            cumulative_panel = performance_panel(
-                "Performance cumulative", "Depuis le premier trade clôturé",
-                net_profit, float(closed_df["result_r"].sum()) if completed else 0.0,
-                win_rate, completed, wins, losses, profit_factor, "#69a9ff"
-            )
-            week_label = (
-                f"Du dimanche {week_start.strftime('%d %b à 17 h')} "
-                f"au vendredi {week_end.strftime('%d %b à 17 h %Y')}"
-            )
-            weekly_panel = performance_panel(
-                "Cette semaine", week_label, week_net_usd, week_net_r,
-                week_win_rate, week_completed, week_wins, week_losses, week_pf, "#b69cff"
-            )
-
-            panel_cols = st.columns(2, gap="medium")
-            with panel_cols[0]:
-                st.markdown(cumulative_panel, unsafe_allow_html=True)
-            with panel_cols[1]:
-                st.markdown(weekly_panel, unsafe_allow_html=True)
-
-            st.caption(
-                f"Ensemble de l'historique : gains bruts {gross_profit:,.2f} $ · "
-                f"pertes brutes -{gross_loss:,.2f} $ · rendement du capital {return_pct:+.2f} % · "
-                f"gain/perte moyen {average_trade:+,.2f} $ par trade."
-            )
+            pnl_cols = st.columns(4)
+            pnl_cols[0].metric("Profit net", f"{net_profit:+,.2f} $")
+            pnl_cols[1].metric("Gains bruts", f"{gross_profit:,.2f} $")
+            pnl_cols[2].metric("Pertes brutes", f"-{gross_loss:,.2f} $")
+            pnl_cols[3].metric("Rendement du capital", f"{return_pct:+.2f} %")
+            extra_cols = st.columns(2)
+            pf_text = f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞"
+            extra_cols[0].metric("Profit factor", pf_text)
+            extra_cols[1].metric("Gain / perte moyen par trade", f"{average_trade:+,.2f} $")
 
             if completed:
                 equity_df = closed_df.copy()
@@ -2140,140 +1575,6 @@ else:
                     showlegend=False
                 )
                 st.plotly_chart(fig_equity, width="stretch")
-
-                # GRAPHIQUES COMPLEMENTAIRES — statistiques issues des trades Supabase
-                st.markdown("#### 📊 Répartition des résultats et performance")
-
-                chart_col1, chart_col2 = st.columns(2)
-
-                # 1) Répartition des trades terminés
-                with chart_col1:
-                    outcome_values = {
-                        "Gagnants": wins,
-                        "Perdants": losses,
-                        "Ambigus": ambiguous,
-                        "Expirés": expired,
-                    }
-                    outcome_values = {
-                        label: value for label, value in outcome_values.items()
-                        if value > 0
-                    }
-                    if outcome_values:
-                        fig_outcomes = go.Figure(data=[go.Pie(
-                            labels=list(outcome_values.keys()),
-                            values=list(outcome_values.values()),
-                            hole=0.62,
-                            sort=False,
-                            textinfo="label+percent",
-                            marker=dict(
-                                colors=["#20d68a", "#ff5b6e", "#ffbf47", "#8294aa"],
-                                line=dict(color="#071426", width=2),
-                            ),
-                            hovertemplate="%{label}<br>%{value} trade(s)<br>%{percent}<extra></extra>",
-                        )])
-                        fig_outcomes.update_layout(
-                            title="Répartition des trades",
-                            height=340,
-                            template="plotly_dark",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            margin=dict(l=15, r=15, t=55, b=15),
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_outcomes, width="stretch")
-                    else:
-                        st.info("Aucun résultat terminé à répartir pour le moment.")
-
-                # 2) Résultat net par instrument, exprimé en R
-                with chart_col2:
-                    if not closed_df.empty and "instrument" in closed_df.columns:
-                        by_instrument = (
-                            closed_df.groupby("instrument", dropna=False)["result_r"]
-                            .sum()
-                            .sort_values()
-                            .reset_index()
-                        )
-                        by_instrument = by_instrument.dropna(subset=["result_r"])
-                        if not by_instrument.empty:
-                            fig_instruments = go.Figure(go.Bar(
-                                x=by_instrument["instrument"].astype(str),
-                                y=by_instrument["result_r"],
-                                marker=dict(
-                                    color=[
-                                        "#20d68a" if value >= 0 else "#ff5b6e"
-                                        for value in by_instrument["result_r"]
-                                    ]
-                                ),
-                                text=[f"{value:+.2f} R" for value in by_instrument["result_r"]],
-                                textposition="outside",
-                                hovertemplate="%{x}<br>Résultat : %{y:+.2f} R<extra></extra>",
-                            ))
-                            fig_instruments.update_layout(
-                                title="Performance par instrument",
-                                height=340,
-                                template="plotly_dark",
-                                paper_bgcolor="rgba(0,0,0,0)",
-                                plot_bgcolor="rgba(0,0,0,0)",
-                                margin=dict(l=15, r=15, t=55, b=35),
-                                yaxis_title="Résultat net (R)",
-                                xaxis_title="",
-                                showlegend=False,
-                                yaxis=dict(zeroline=True, zerolinecolor="#7890aa"),
-                            )
-                            st.plotly_chart(fig_instruments, width="stretch")
-                        else:
-                            st.info("Pas encore assez de résultats par instrument.")
-                    else:
-                        st.info("Les résultats par instrument apparaîtront après les premiers trades clôturés.")
-
-                # 3) Résultat hebdomadaire en R
-                if not closed_df.empty and "close_time" in closed_df.columns:
-                    weekly_df = closed_df.copy()
-                    weekly_df["_close_date"] = pd.to_datetime(
-                        weekly_df["close_time"], errors="coerce", utc=True
-                    )
-                    weekly_df["result_r"] = pd.to_numeric(
-                        weekly_df["result_r"], errors="coerce"
-                    )
-                    weekly_df = weekly_df.dropna(subset=["_close_date", "result_r"])
-                    if not weekly_df.empty:
-                        weekly_df["_week"] = (
-                            weekly_df["_close_date"]
-                            .dt.tz_convert("America/New_York")
-                            .dt.to_period("W")
-                            .astype(str)
-                        )
-                        weekly_results = (
-                            weekly_df.groupby("_week")["result_r"]
-                            .sum()
-                            .reset_index()
-                        )
-                        fig_weekly = go.Figure(go.Bar(
-                            x=weekly_results["_week"],
-                            y=weekly_results["result_r"],
-                            marker=dict(
-                                color=[
-                                    "#20d68a" if value >= 0 else "#ff5b6e"
-                                    for value in weekly_results["result_r"]
-                                ]
-                            ),
-                            text=[f"{value:+.2f} R" for value in weekly_results["result_r"]],
-                            textposition="outside",
-                            hovertemplate="Semaine %{x}<br>Résultat : %{y:+.2f} R<extra></extra>",
-                        ))
-                        fig_weekly.update_layout(
-                            title="Résultat par semaine",
-                            height=320,
-                            template="plotly_dark",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            margin=dict(l=20, r=20, t=55, b=45),
-                            xaxis_title="Semaine de clôture (heure de New York)",
-                            yaxis_title="Résultat net (R)",
-                            showlegend=False,
-                            yaxis=dict(zeroline=True, zerolinecolor="#7890aa"),
-                        )
-                        st.plotly_chart(fig_weekly, width="stretch")
 
             display_columns = [
                 "created_at", "instrument", "timeframe", "direction", "fib_mode",
@@ -2332,3 +1633,33 @@ if not alert_history.empty:
     )
 else:
     st.info("Le journal sera créé automatiquement à la première nouvelle alerte confirmée.")
+
+# PROFIT / LOSS LAST 7 DAYS
+st.markdown("---")
+st.subheader("📅 Profits / Pertes (7 derniers jours)")
+try:
+    since = (datetime.now(pytz.UTC) - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
+    request = TransactionList(accountID=ACCOUNT_ID, params={"from": since})
+    client.request(request)
+    transactions = request.response.get("transactions", [])
+    pnl = {}
+
+    for transaction in transactions:
+        if transaction.get("type") == "ORDER_FILL" and "pl" in transaction:
+            day = transaction["time"].split("T")[0]
+            pnl[day] = pnl.get(day, 0.0) + float(transaction["pl"])
+
+    if pnl:
+        pnl_df = pd.DataFrame(sorted(pnl.items()), columns=["Date", "P&L"])
+        pnl_df["P&L"] = pnl_df["P&L"].round(2)
+        pnl_df["Status"] = pnl_df["P&L"].apply(
+            lambda value: "🟢 Gain" if value >= 0 else "🔴 Perte"
+        )
+        st.dataframe(pnl_df, width="stretch", hide_index=True)
+    else:
+        st.info("Aucune transaction enregistrée dans les 7 derniers jours.")
+except Exception as exc:
+    st.error(f"Erreur OANDA dans l'historique des transactions : {exc}")
+
+now = datetime.now(pytz.timezone("America/New_York"))
+st.caption(f"🕒 Dernière mise à jour : {now.strftime('%Y-%m-%d %H:%M:%S')} NY")
