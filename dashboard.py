@@ -15,6 +15,7 @@ import smtplib
 import requests
 import hashlib
 import json
+import re
 from pathlib import Path
 from email.mime.text import MIMEText
 
@@ -361,23 +362,48 @@ def load_oanda_real_performance(days=90):
     )
     client.request(transaction_request)
     transaction_response = transaction_request.response or {}
-    transactions_list = transaction_response.get("transactions", [])
 
-    # Certains comptes peuvent avoir plus de 1 000 transactions dans la période.
-    # On suit les pages retournées par OANDA, sans reconstruire d'URL manuellement.
+    # IMPORTANT : TransactionList ne renvoie PAS les transactions elles-mêmes.
+    # OANDA renvoie une liste d'URL /transactions/idrange dans "pages".
+    # Il faut appeler TransactionIDRange pour chaque intervalle afin de récupérer
+    # les objets transactions (ORDER_FILL, TRADE_CLOSE, etc.).
+    transactions_list = []
     page_urls = transaction_response.get("pages", []) or []
-    for page_url in page_urls[1:10]:
+    page_errors = []
+    for page_url in page_urls:
+        match = re.search(r"[?&]from=(\d+).*?[&]to=(\d+)", str(page_url))
+        if not match:
+            match = re.search(r"[?&]to=(\d+).*?[&]from=(\d+)", str(page_url))
+            if match:
+                from_id, to_id = match.group(2), match.group(1)
+            else:
+                page_errors.append(f"URL de page OANDA non reconnue : {page_url}")
+                continue
+        else:
+            from_id, to_id = match.group(1), match.group(2)
+
         try:
-            page_request = oanda_transactions.TransactionList(
-                ACCOUNT_ID, params={"page": page_url}
+            page_request = oanda_transactions.TransactionIDRange(
+                ACCOUNT_ID,
+                params={"from": from_id, "to": to_id},
             )
             client.request(page_request)
             transactions_list.extend(
-                page_request.response.get("transactions", []) or []
+                (page_request.response or {}).get("transactions", []) or []
             )
-        except Exception:
-            # La première page reste exploitable si une page historique échoue.
-            break
+        except Exception as page_exc:
+            page_errors.append(
+                f"Échec récupération transactions {from_id}-{to_id} : {page_exc}"
+            )
+
+    # Déduplique par ID au cas où deux intervalles se chevaucheraient.
+    unique_transactions = {}
+    for tx in transactions_list:
+        tx_id = str(tx.get("id", ""))
+        if tx_id:
+            unique_transactions[tx_id] = tx
+    transactions_list = list(unique_transactions.values())
+    transactions_list.sort(key=lambda item: int(item.get("id", 0) or 0))
 
     fills = []
     for tx in transactions_list:
@@ -432,6 +458,9 @@ def load_oanda_real_performance(days=90):
         "fills": fills_df,
         "open_trades": open_df,
         "transactions_count": len(transactions_list),
+        "transaction_pages": len(page_urls),
+        "transaction_page_errors": page_errors,
+        "transaction_api_count": int(transaction_response.get("count", 0) or 0),
     }
 
 
@@ -1702,8 +1731,12 @@ try:
     st.caption(
         f"Marge disponible : {margin_available:,.2f} {currency_label} · "
         f"{len(oanda_open)} position(s) ouverte(s) · "
-        f"Historique interrogé : 90 jours · Fuseau : Québec"
+        f"{oanda_data['transactions_count']} transaction(s) récupérée(s) / "
+        f"{oanda_data['transaction_api_count']} annoncée(s) par OANDA · "
+        f"{oanda_data['transaction_pages']} page(s) · Historique : 90 jours · Québec"
     )
+    for page_error in oanda_data.get("transaction_page_errors", []):
+        st.warning(page_error)
 
     if not oanda_fills.empty:
         st.markdown("#### 📆 Historique quotidien OANDA")
